@@ -10,7 +10,7 @@ ENV TZ=Etc/UTC
 
 # Configure base OS and install packages
 RUN apt-get update && apt-get -y install apt-utils tzdata stunnel supervisor python3 python3-pip ffmpeg
-RUN pip install boto3 pydicom pynetdicom environs ffmpeg-python Pillow
+RUN pip install boto3 pydicom pynetdicom environs ffmpeg-python Pillow numpy
 
 WORKDIR /app
 

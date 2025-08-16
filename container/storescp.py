@@ -94,19 +94,37 @@ def convert_dicom_to_jpeg(dicom_path, output_path):
         return False
 
 def convert_dicom_to_webm(dicom_path, output_path, frame_rate=24):
-    """Converts a multi-frame DICOM to WebM."""
+    """Converts a multi-frame DICOM to WebM by extracting frames."""
     try:
+        ds = dcmread(dicom_path)
+        if not hasattr(ds, 'pixel_array') or ds.pixel_array.ndim < 3:
+            logging.error(f"DICOM file {dicom_path} does not contain multi-frame pixel data.")
+            return False
+
+        temp_dir = tempfile.mkdtemp()
+        frame_paths = []
+
+        for i, frame in enumerate(ds.pixel_array):
+            frame_path = os.path.join(temp_dir, f"frame_{i:04d}.png")
+            img = Image.fromarray(frame)
+            img.save(frame_path, "png")
+            frame_paths.append(frame_path)
+
+        # Use ffmpeg to combine frames into WebM
         (
             ffmpeg
-            .input(dicom_path)
-            .output(output_path, r=frame_rate, vcodec='libvpx-vp9')
+            .input(os.path.join(temp_dir, "frame_%04d.png"), framerate=frame_rate)
+            .output(output_path, r=frame_rate, vcodec='libvpx-vp9', crf=23, preset='veryfast')
             .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
         )
         logging.info(f"Successfully converted {dicom_path} to {output_path}")
         return True
-    except ffmpeg.Error as e:
-        logging.error(f"Error converting DICOM to WebM: {e.stderr.decode()}")
+    except Exception as e:
+        logging.error(f"Error converting DICOM to WebM: {e}")
         return False
+    finally:
+        if 'temp_dir' in locals() and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
 
 def process_and_upload(dicom_path):
     """

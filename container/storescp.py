@@ -187,13 +187,13 @@ def process_and_upload(dicom_path):
 
     if metadata.get("NumberOfFrames", 1) > 1:
         output_path += ".webm"
-        s3_key = f"{folder_name}{s3_prefix}/{study_instance_uid}/{series_instance_uid}/{sop_instance_uid}.webm"
+        s3_key = f"{folder_name}{s3_prefix}{study_instance_uid}/{series_instance_uid}/{sop_instance_uid}.webm"
         content_type = "video/webm"
         if not convert_dicom_to_webm(dicom_path, output_path, metadata.get("RecommendedDisplayFrameRate")):
             return
     else:
         output_path += ".jpeg"
-        s3_key = f"{folder_name}{s3_prefix}/{study_instance_uid}/{series_instance_uid}/{sop_instance_uid}.jpeg"
+        s3_key = f"{folder_name}{s3_prefix}{study_instance_uid}/{series_instance_uid}/{sop_instance_uid}.jpeg"
         content_type = "image/jpeg"
         if not convert_dicom_to_jpeg(dicom_path, output_path):
             return

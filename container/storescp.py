@@ -78,6 +78,11 @@ def get_dicom_metadata(dicom_file):
             "RecommendedDisplayFrameRate": int(ds.RecommendedDisplayFrameRate) if "RecommendedDisplayFrameRate" in ds else 24,
             "SOPInstanceUID": str(ds.SOPInstanceUID) if "SOPInstanceUID" in ds else "N/A",
             "StudyInstanceUID": str(ds.StudyInstanceUID) if "StudyInstanceUID" in ds else "N/A",
+            "SeriesInstanceUID": str(ds.SeriesInstanceUID) if "SeriesInstanceUID" in ds else "N/A",
+            "StageName": str(ds.StageName) if "StageName" in ds else "N/A",
+            "View": str(ds.ViewCodeSequence[0].CodeMeaning) if "ViewCodeSequence" in ds and len(ds.ViewCodeSequence) > 0 else "N/A",
+            "InstanceNumber": str(ds.InstanceNumber) if "InstanceNumber" in ds else "N/A",
+            "SeriesNumber": str(ds.SeriesNumber) if "SeriesNumber" in ds else "N/A",
         }
         return metadata
     except Exception as e:
@@ -179,7 +184,12 @@ def process_and_upload(dicom_path):
             "PatientSex": metadata.get("PatientSex", "N/A"),
             "PatientBirthDate": metadata.get("PatientBirthDate", "N/A"),
             "StudyInstanceUID": study_instance_uid,
-            "SOPInstanceUID": sop_instance_uid
+            "SOPInstanceUID": sop_instance_uid,
+            "SeriesInstanceUID": metadata.get("SeriesInstanceUID", "N/A"),
+            "StageName": metadata.get("StageName", "N/A"),
+            "View": metadata.get("View", "N/A"),
+            "InstanceNumber": metadata.get("InstanceNumber", "N/A"),
+            "SeriesNumber": metadata.get("SeriesNumber", "N/A"),
         },
         "s3Url": s3_url
     }

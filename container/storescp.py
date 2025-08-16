@@ -63,7 +63,38 @@ s3client = boto3.client('s3', region_name=region, config=botocore.client.Config(
 logging.info(f'Provisioning ThreadPool of {s3_upload_workers} S3 upload workers.')
 executor = ThreadPoolExecutor(max_workers=int(s3_upload_workers))
 
-#debug_logger()
+def get_dicom_fps(ds):
+    try:
+        fps = None
+
+        # Check RecommendedDisplayFrameRate (0018,0040) → ds.RecommendedDisplayFrameRate
+        if "RecommendedDisplayFrameRate" in ds:
+            try:
+                fps = int(ds.RecommendedDisplayFrameRate)
+                if fps > 0:
+                    print(f"📋 Found RecommendedDisplayFrameRate: {fps} FPS")
+                    return fps if fps >= 30 else 50
+            except Exception:
+                pass
+
+        # Check FrameTime (0018,1063) → ds.FrameTime (milliseconds per frame)
+        if "FrameTime" in ds:
+            try:
+                frame_time = float(ds.FrameTime)  # in ms
+                if frame_time > 0:
+                    fps = round(1000 / frame_time)
+                    print(f"📋 Calculated FPS from FrameTime: {fps} FPS")
+                    return fps if fps >= 30 else 50
+            except Exception:
+                pass
+
+        # Default fallback
+        print("⚠️ No FPS found in DICOM metadata, using default: 50 FPS")
+        return 50
+
+    except Exception as e:
+        print(f"❌ Error reading DICOM FPS: {e}")
+        return 50
 
 def get_dicom_metadata(dicom_file):
     """Extracts relevant metadata from a DICOM file."""
@@ -75,7 +106,7 @@ def get_dicom_metadata(dicom_file):
             "PatientSex": str(ds.PatientSex) if "PatientSex" in ds else "N/A",
             "PatientBirthDate": str(ds.PatientBirthDate) if "PatientBirthDate" in ds else "N/A",
             "NumberOfFrames": int(ds.NumberOfFrames) if "NumberOfFrames" in ds else 1,
-            "RecommendedDisplayFrameRate": int(ds.RecommendedDisplayFrameRate) if "RecommendedDisplayFrameRate" in ds else 24,
+            "RecommendedDisplayFrameRate": get_dicom_fps(ds),
             "SOPInstanceUID": str(ds.SOPInstanceUID) if "SOPInstanceUID" in ds else "N/A",
             "StudyInstanceUID": str(ds.StudyInstanceUID) if "StudyInstanceUID" in ds else "N/A",
             "SeriesInstanceUID": str(ds.SeriesInstanceUID) if "SeriesInstanceUID" in ds else "N/A",
@@ -143,6 +174,7 @@ def process_and_upload(dicom_path):
         return
 
     sop_instance_uid = metadata.get("SOPInstanceUID", "unknown_sop")
+    series_instance_uid = metadata.get("SeriesInstanceUID", "unknown_series")
     study_instance_uid = metadata.get("StudyInstanceUID", "unknown_study")
 
     if add_studyuid_prefix:
@@ -155,13 +187,13 @@ def process_and_upload(dicom_path):
 
     if metadata.get("NumberOfFrames", 1) > 1:
         output_path += ".webm"
-        s3_key = f"{folder_name}/webm/{s3_prefix}{sop_instance_uid}.webm"
+        s3_key = f"{folder_name}/{s3_prefix}/{study_instance_uid}/{series_instance_uid}/{sop_instance_uid}.webm"
         content_type = "video/webm"
         if not convert_dicom_to_webm(dicom_path, output_path, metadata.get("RecommendedDisplayFrameRate")):
             return
     else:
         output_path += ".jpeg"
-        s3_key = f"{folder_name}/jpeg/{s3_prefix}{sop_instance_uid}.jpeg"
+        s3_key = f"{folder_name}/{s3_prefix}/{study_instance_uid}/{series_instance_uid}/{sop_instance_uid}.jpeg"
         content_type = "image/jpeg"
         if not convert_dicom_to_jpeg(dicom_path, output_path):
             return

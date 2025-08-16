@@ -114,7 +114,7 @@ def convert_dicom_to_webm(dicom_path, output_path, frame_rate=24):
         (
             ffmpeg
             .input(os.path.join(temp_dir, "frame_%04d.png"), framerate=frame_rate)
-            .output(output_path, r=frame_rate, vcodec='libvpx-vp9', crf=23, preset='veryfast')
+            .output(output_path, r=frame_rate, vcodec='libvpx-vp9', crf=23, preset='veryfast', pix_fmt='yuv420p', profile='0')\
             .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
         )
         logging.info(f"Successfully converted {dicom_path} to {output_path}")
@@ -161,6 +161,12 @@ def process_and_upload(dicom_path):
     s3_metadata = {key.lower(): str(value) for key, value in metadata.items()}
     
     executor.submit(s3_upload, output_path, bucket, s3_key, content_type, s3_metadata)
+
+    # Log patient demographics and S3 URL
+    patient_name = metadata.get("PatientName", "N/A")
+    patient_id = metadata.get("PatientID", "N/A")
+    s3_url = f"https://{bucket}.s3.{region}.amazonaws.com/{s3_key}"
+    logging.info(f"Processed DICOM for Patient: {patient_name} (ID: {patient_id}), study Instance UID: {study_instance_uid}, SOP Instance UID: {sop_instance_uid}. Uploaded to S3: {s3_url}")
 
 # Implement a handler for evt.EVT_C_STORE
 def handle_store(event):

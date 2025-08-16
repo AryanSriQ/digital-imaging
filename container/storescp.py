@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import requests
 import io
 import os
 import logging
@@ -26,6 +27,8 @@ env=Env()
 # mandatory:
 region = env("AWS_REGION")
 bucket = env("RECEIVE_BUCKET")
+folder_name = env("FOLDER_NAME")
+backend_url = env("BACKEND_URL")
 # optional, with defaults:
 create_metadata = env.bool("CREATE_METADATA", False)
 gzip_files = env.bool("GZIP_FILES", False)
@@ -147,13 +150,13 @@ def process_and_upload(dicom_path):
 
     if metadata.get("NumberOfFrames", 1) > 1:
         output_path += ".webm"
-        s3_key = f"{s3_prefix}{sop_instance_uid}.webm"
+        s3_key = f"{folder_name}/webm/{s3_prefix}{sop_instance_uid}.webm"
         content_type = "video/webm"
         if not convert_dicom_to_webm(dicom_path, output_path, metadata.get("RecommendedDisplayFrameRate")):
             return
     else:
         output_path += ".jpeg"
-        s3_key = f"{s3_prefix}{sop_instance_uid}.jpeg"
+        s3_key = f"{folder_name}/jpeg/{s3_prefix}{sop_instance_uid}.jpeg"
         content_type = "image/jpeg"
         if not convert_dicom_to_jpeg(dicom_path, output_path):
             return
@@ -165,8 +168,30 @@ def process_and_upload(dicom_path):
     # Log patient demographics and S3 URL
     patient_name = metadata.get("PatientName", "N/A")
     patient_id = metadata.get("PatientID", "N/A")
-    s3_url = f"https://{bucket}.s3.{region}.amazonaws.com/{s3_key}"
+    s3_url = f"{s3_key}"
     logging.info(f"Processed DICOM for Patient: {patient_name} (ID: {patient_id}), study Instance UID: {study_instance_uid}, SOP Instance UID: {sop_instance_uid}. Uploaded to S3: {s3_url}")
+
+    # Prepare payload for POST API
+    api_payload = {
+        "patientDemographics": {
+            "PatientName": patient_name,
+            "PatientID": patient_id,
+            "PatientSex": metadata.get("PatientSex", "N/A"),
+            "PatientBirthDate": metadata.get("PatientBirthDate", "N/A"),
+            "StudyInstanceUID": study_instance_uid,
+            "SOPInstanceUID": sop_instance_uid
+        },
+        "s3Url": s3_url
+    }
+
+    # Make POST request to the API
+    api_url = f"{backend_url}/common/uploadDicomFileFromECS"
+    try:
+        response = requests.post(api_url, json=api_payload)
+        response.raise_for_status()  # Raise an exception for HTTP errors (4xx or 5xx)
+        logging.info(f"Successfully sent data to API. Status: {response.status_code}, Response: {response.text}")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error sending data to API: {e}")
 
 # Implement a handler for evt.EVT_C_STORE
 def handle_store(event):

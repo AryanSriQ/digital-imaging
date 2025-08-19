@@ -9,13 +9,13 @@ RECEIVE_BUCKET_NAME = "" # optional. Name of an existing bucket in the same regi
 
 # VPC options
 VPC_CIDR = "10.29.0.0/16" # cidr for the vpc that will be provisioned.
-PUBLIC_LOAD_BALANCER = False # If this is set to True, the NLB will have a public Internet IP address
+PUBLIC_LOAD_BALANCER = True # If this is set to True, the NLB will have a public Internet IP address
 ALLOW_NON_TLS_PORT = True # allow security group access to the non-encrypted port
 ALLOWED_PEERS = {
         # access from the provisioned VPC is allowed, specify additional allowed peers:
         #"172.31.0.0/16", # Allow from a subnet, in a peered VPC or remote private network.
         #"123.123.123.123/32", # Allow access from individual IP address, public or private
-        #"0.0.0.0/0", # Allow access from anywhere
+        "0.0.0.0/0", # Allow access from anywhere
     }
 
 # Application Options

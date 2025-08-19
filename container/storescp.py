@@ -10,6 +10,7 @@ import gzip
 import shutil
 import tempfile
 import ffmpeg
+import time
 from PIL import Image
 from environs import Env
 from concurrent.futures import ThreadPoolExecutor
@@ -53,6 +54,14 @@ if metadata_prefix:
 
 # set default logging configuration
 logging.basicConfig(format='%(levelname)s - %(asctime)s.%(msecs)03d %(threadName)s: %(message)s',datefmt='%H:%M:%S', level=loglevel)   
+
+class NoUnknownPDUTypeFilter(logging.Filter):
+    def filter(self, record):
+        return "Unknown PDU type received" not in record.getMessage()
+
+# Add the filter to the root logger
+logging.getLogger().addFilter(NoUnknownPDUTypeFilter())
+
 logging.info(f'Setting log level to {loglevel}')
 
 # create a shared S3 client and use it for all threads (clients are thread-safe)
@@ -176,6 +185,11 @@ def process_and_upload(dicom_path):
     sop_instance_uid = metadata.get("SOPInstanceUID", "unknown_sop")
     series_instance_uid = metadata.get("SeriesInstanceUID", "unknown_series")
     study_instance_uid = metadata.get("StudyInstanceUID", "unknown_study")
+    
+    # Get file size in MB
+    file_size_mb = os.path.getsize(dicom_path) / (1024 * 1024)
+    conversion_start_time = time.time()
+    logging.info(f"Starting conversion of {dicom_path} ({file_size_mb:.2f} MB), at {conversion_start_time}")
 
     if add_studyuid_prefix:
         s3_prefix = f"{dicom_prefix}{study_instance_uid}/"
@@ -197,6 +211,10 @@ def process_and_upload(dicom_path):
         content_type = "image/jpeg"
         if not convert_dicom_to_jpeg(dicom_path, output_path):
             return
+    
+    conversion_end_time = time.time()
+    conversion_time = conversion_end_time - conversion_start_time
+    logging.info(f"Total conversion time: {conversion_time} seconds")
 
     s3_metadata = {key.lower(): str(value) for key, value in metadata.items()}
     
@@ -238,6 +256,8 @@ def process_and_upload(dicom_path):
 # Implement a handler for evt.EVT_C_STORE
 def handle_store(event):
     """Handle a C-STORE request event."""
+    storing_start_time = time.time()
+    logging.info(f"Starting at: {storing_start_time}")
  
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".dcm") as temp_dicom:
@@ -259,6 +279,10 @@ def handle_store(event):
             logging.info(f'Injecting C-STORE delay: {cstore_delay_ms} ms')
             time.sleep(int(cstore_delay_ms) / 1000)
             
+        storing_end_time = time.time()
+        storing_elapsed_time = storing_end_time - storing_start_time
+
+        logging.info(f'Total time taken to convert and store: {storing_elapsed_time:.2f} seconds')
     except BaseException as e:
         logging.error(f'Error in C-STORE processing. {e}')
         return 0xC211

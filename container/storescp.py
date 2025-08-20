@@ -10,11 +10,17 @@ import gzip
 import shutil
 import tempfile
 import ffmpeg
-import time
+import threading
+import asyncio
+import aiohttp
+from queue import Queue, Full, Empty
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
 from PIL import Image
 from environs import Env
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import as_completed
+from concurrent.futures import ThreadPoolExecutor, Future, as_completed
+import weakref
 
 import boto3
 import botocore
@@ -24,7 +30,7 @@ from pydicom.filewriter import write_file_meta_info
 from pydicom.filereader import dcmread
 
 # Parse the environment
-env=Env()
+env = Env()
 # mandatory:
 region = env("AWS_REGION")
 bucket = env("RECEIVE_BUCKET")
@@ -36,24 +42,35 @@ gzip_files = env.bool("GZIP_FILES", False)
 gzip_level = env.int("GZIP_LEVEL", 5)
 add_studyuid_prefix = env.bool("ADD_STUDYUID_PREFIX", False)
 s3_upload_workers = env.int("S3_UPLOAD_WORKERS", 10)
-scp_port = env.int("SCP_PORT", 11112)   
+conversion_workers = env.int("CONVERSION_WORKERS", 5)
+api_workers = env.int("API_WORKERS", 3)
+scp_port = env.int("SCP_PORT", 11112)
 loglevel = env.log_level("LOG_LEVEL", "INFO")
-dicom_prefix = env("DICOM_PREFIX","")
-metadata_prefix = env("METADATA_PREFIX","")
+dicom_prefix = env("DICOM_PREFIX", "")
+metadata_prefix = env("METADATA_PREFIX", "")
 cstore_delay_ms = env.int("CSTORE_DELAY_MS", 0)
-boto_max_pool_connections = env.int("BOTO_MAX_POOL_CONNECTIONS", 10)
+boto_max_pool_connections = env.int("BOTO_MAX_POOL_CONNECTIONS", 20)
 dimse_timeout = env.int("DIMSE_TIMEOUT", 30)
 maximum_associations = env.int("MAXIMUM_ASSOCIATIONS", 10)
 maximum_pdu_size = env.int("MAXIMUM_PDU_SIZE", 0)
 network_timeout = env.int("NETWORK_TIMEOUT", 60)
+max_queue_size = env.int("MAX_QUEUE_SIZE", 1000)
+max_concurrent_processing = env.int("MAX_CONCURRENT_PROCESSING", 50)
+api_timeout = env.int("API_TIMEOUT", 30)
+api_retry_attempts = env.int("API_RETRY_ATTEMPTS", 3)
+health_check_interval = env.int("HEALTH_CHECK_INTERVAL", 60)
 
 if dicom_prefix: 
     dicom_prefix = dicom_prefix + '/'
 if metadata_prefix:
-    metadata_prefix = metadata_prefix + '/'   
+    metadata_prefix = metadata_prefix + '/'
 
-# set default logging configuration
-logging.basicConfig(format='%(levelname)s - %(asctime)s.%(msecs)03d %(threadName)s: %(message)s',datefmt='%H:%M:%S', level=loglevel)   
+# Set default logging configuration
+logging.basicConfig(
+    format='%(levelname)s - %(asctime)s.%(msecs)03d %(threadName)s: %(message)s',
+    datefmt='%H:%M:%S', 
+    level=loglevel
+)
 
 class NoUnknownPDUTypeFilter(logging.Filter):
     def filter(self, record):
@@ -64,45 +81,521 @@ logging.getLogger().addFilter(NoUnknownPDUTypeFilter())
 
 logging.info(f'Setting log level to {loglevel}')
 
-# create a shared S3 client and use it for all threads (clients are thread-safe)
-logging.info(f'Creating S3 client with max_pool_connections = {boto_max_pool_connections}.')
-s3client = boto3.client('s3', region_name=region, config=botocore.client.Config(max_pool_connections=boto_max_pool_connections) )
+@dataclass
+class ProcessingTask:
+    """Data class for processing tasks"""
+    dicom_path: str
+    task_id: str
+    created_at: float
+    
+@dataclass
+class ConversionResult:
+    """Data class for conversion results"""
+    task_id: str
+    success: bool
+    output_path: Optional[str] = None
+    s3_key: Optional[str] = None
+    content_type: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
 
-# initialize thread pool
-logging.info(f'Provisioning ThreadPool of {s3_upload_workers} S3 upload workers.')
-executor = ThreadPoolExecutor(max_workers=int(s3_upload_workers))
+@dataclass
+class ProcessingMetrics:
+    """Metrics tracking for the processing pipeline"""
+    total_received: int = 0
+    total_processed: int = 0
+    total_failed: int = 0
+    total_uploaded: int = 0
+    upload_failures: int = 0
+    api_successes: int = 0
+    api_failures: int = 0
+    queue_depth: int = 0
+    processing_times: list = None
+    
+    def __post_init__(self):
+        if self.processing_times is None:
+            self.processing_times = []
+
+class CircuitBreaker:
+    """Simple circuit breaker for API calls"""
+    def __init__(self, failure_threshold: int = 5, timeout: int = 60):
+        self.failure_threshold = failure_threshold
+        self.timeout = timeout
+        self.failure_count = 0
+        self.last_failure_time = 0
+        self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+        self._lock = threading.Lock()
+    
+    def can_execute(self) -> bool:
+        with self._lock:
+            if self.state == "CLOSED":
+                return True
+            elif self.state == "OPEN":
+                if time.time() - self.last_failure_time > self.timeout:
+                    self.state = "HALF_OPEN"
+                    return True
+                return False
+            else:  # HALF_OPEN
+                return True
+    
+    def on_success(self):
+        with self._lock:
+            self.failure_count = 0
+            self.state = "CLOSED"
+    
+    def on_failure(self):
+        with self._lock:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            if self.failure_count >= self.failure_threshold:
+                self.state = "OPEN"
+
+class ResourceManager:
+    """Manages all processing resources and queues"""
+    
+    def __init__(self):
+        # Create bounded queues
+        self.conversion_queue = Queue(maxsize=max_queue_size)
+        self.upload_queue = Queue(maxsize=max_queue_size)
+        self.api_queue = Queue(maxsize=max_queue_size)
+        
+        # Create separate thread pools
+        self.conversion_executor = ThreadPoolExecutor(
+            max_workers=conversion_workers,
+            thread_name_prefix="conversion"
+        )
+        self.upload_executor = ThreadPoolExecutor(
+            max_workers=s3_upload_workers,
+            thread_name_prefix="upload"
+        )
+        self.api_executor = ThreadPoolExecutor(
+            max_workers=api_workers,
+            thread_name_prefix="api"
+        )
+        
+        # Track active futures with weak references to prevent memory leaks
+        self.active_futures = weakref.WeakSet()
+        self.metrics = ProcessingMetrics()
+        self.circuit_breaker = CircuitBreaker()
+        self._shutdown_event = threading.Event()
+        
+        # Create S3 client with connection pooling
+        self.s3_client = boto3.client(
+            's3', 
+            region_name=region,
+            config=botocore.client.Config(
+                max_pool_connections=boto_max_pool_connections,
+                retries={'max_attempts': 3, 'mode': 'adaptive'}
+            )
+        )
+        
+        # Start worker threads
+        self._start_workers()
+        
+        # Start health check thread
+        self.health_check_thread = threading.Thread(
+            target=self._health_check_loop,
+            daemon=True,
+            name="health-check"
+        )
+        self.health_check_thread.start()
+    
+    def _start_workers(self):
+        """Start background worker threads"""
+        threading.Thread(
+            target=self._conversion_worker,
+            daemon=True,
+            name="conversion-dispatcher"
+        ).start()
+        
+        threading.Thread(
+            target=self._upload_worker,
+            daemon=True,
+            name="upload-dispatcher"
+        ).start()
+        
+        threading.Thread(
+            target=self._api_worker,
+            daemon=True,
+            name="api-dispatcher"
+        ).start()
+    
+    def _health_check_loop(self):
+        """Periodic health check and cleanup"""
+        while not self._shutdown_event.wait(health_check_interval):
+            try:
+                self._cleanup_completed_futures()
+                self._log_metrics()
+            except Exception as e:
+                logging.error(f"Health check error: {e}")
+    
+    def _cleanup_completed_futures(self):
+        """Clean up completed futures to prevent memory leaks"""
+        # Note: WeakSet automatically removes unreferenced futures
+        active_count = len(self.active_futures)
+        logging.debug(f"Active futures: {active_count}")
+    
+    def _log_metrics(self):
+        """Log current processing metrics"""
+        m = self.metrics
+        logging.info(
+            f"Metrics - Received: {m.total_received}, Processed: {m.total_processed}, "
+            f"Failed: {m.total_failed}, Queue depth: {m.queue_depth}, "
+            f"Upload success: {m.total_uploaded}, Upload failures: {m.upload_failures}, "
+            f"API success: {m.api_successes}, API failures: {m.api_failures}"
+        )
+    
+    def can_accept_task(self) -> bool:
+        """Check if system can accept new processing tasks"""
+        return (self.conversion_queue.qsize() < max_queue_size * 0.9 and 
+                len(self.active_futures) < max_concurrent_processing)
+    
+    def submit_task(self, task: ProcessingTask) -> bool:
+        """Submit a new processing task"""
+        try:
+            self.conversion_queue.put_nowait(task)
+            self.metrics.total_received += 1
+            self.metrics.queue_depth = self.conversion_queue.qsize()
+            return True
+        except Full:
+            logging.warning("Conversion queue full, rejecting task")
+            return False
+    
+    def _conversion_worker(self):
+        """Worker thread for processing conversion queue"""
+        while not self._shutdown_event.is_set():
+            try:
+                task = self.conversion_queue.get(timeout=1.0)
+                future = self.conversion_executor.submit(self._process_dicom, task)
+                self.active_futures.add(future)
+                future.add_done_callback(self._handle_conversion_result)
+                self.conversion_queue.task_done()
+                self.metrics.queue_depth = self.conversion_queue.qsize()
+            except Empty:
+                continue
+            except Exception as e:
+                logging.error(f"Conversion worker error: {e}")
+    
+    def _upload_worker(self):
+        """Worker thread for processing upload queue"""
+        while not self._shutdown_event.is_set():
+            try:
+                result = self.upload_queue.get(timeout=1.0)
+                future = self.upload_executor.submit(self._upload_to_s3, result)
+                self.active_futures.add(future)
+                future.add_done_callback(self._handle_upload_result)
+                self.upload_queue.task_done()
+            except Empty:
+                continue
+            except Exception as e:
+                logging.error(f"Upload worker error: {e}")
+    
+    def _api_worker(self):
+        """Worker thread for processing API queue"""
+        while not self._shutdown_event.is_set():
+            try:
+                payload = self.api_queue.get(timeout=1.0)
+                future = self.api_executor.submit(self._send_api_notification, payload)
+                self.active_futures.add(future)
+                future.add_done_callback(self._handle_api_result)
+                self.api_queue.task_done()
+            except Empty:
+                continue
+            except Exception as e:
+                logging.error(f"API worker error: {e}")
+    
+    def _handle_conversion_result(self, future: Future):
+        """Handle conversion completion"""
+        try:
+            result = future.result()
+            if result.success:
+                self.metrics.total_processed += 1
+                self.upload_queue.put_nowait(result)
+            else:
+                self.metrics.total_failed += 1
+                logging.error(f"Conversion failed for task {result.task_id}: {result.error}")
+        except Exception as e:
+            self.metrics.total_failed += 1
+            logging.error(f"Conversion result handling error: {e}")
+    
+    def _handle_upload_result(self, future: Future):
+        """Handle upload completion"""
+        try:
+            success, result = future.result()
+            if success:
+                self.metrics.total_uploaded += 1
+                # Queue for API notification
+                if result.metadata:
+                    api_payload = self._create_api_payload(result)
+                    self.api_queue.put_nowait(api_payload)
+            else:
+                self.metrics.upload_failures += 1
+        except Exception as e:
+            self.metrics.upload_failures += 1
+            logging.error(f"Upload result handling error: {e}")
+    
+    def _handle_api_result(self, future: Future):
+        """Handle API notification completion"""
+        try:
+            success = future.result()
+            if success:
+                self.metrics.api_successes += 1
+                self.circuit_breaker.on_success()
+            else:
+                self.metrics.api_failures += 1
+                self.circuit_breaker.on_failure()
+        except Exception as e:
+            self.metrics.api_failures += 1
+            self.circuit_breaker.on_failure()
+            logging.error(f"API result handling error: {e}")
+    
+    def _process_dicom(self, task: ProcessingTask) -> ConversionResult:
+        """Process DICOM file with proper error handling and cleanup"""
+        start_time = time.time()
+        temp_files_to_cleanup = []  # Only for cleanup on error
+        
+        try:
+            # Extract metadata first
+            metadata = get_dicom_metadata(task.dicom_path)
+            if not metadata:
+                return ConversionResult(
+                    task_id=task.task_id,
+                    success=False,
+                    error="Failed to extract DICOM metadata"
+                )
+            
+            # Determine conversion type and paths
+            sop_instance_uid = metadata.get("SOPInstanceUID", "unknown_sop")
+            series_instance_uid = metadata.get("SeriesInstanceUID", "unknown_series")
+            study_instance_uid = metadata.get("StudyInstanceUID", "unknown_study")
+            
+            if add_studyuid_prefix:
+                s3_prefix = f"{dicom_prefix}{study_instance_uid}/"
+            else:
+                s3_prefix = dicom_prefix
+            
+            # Create temporary output file
+            temp_output = tempfile.NamedTemporaryFile(delete=False)
+            temp_files_to_cleanup.append(temp_output.name)
+            temp_output.close()
+            
+            # Convert based on frame count
+            if metadata.get("NumberOfFrames", 1) > 1:
+                output_path = temp_output.name + ".webm"
+                s3_key = f"{folder_name}/{s3_prefix}{study_instance_uid}/{series_instance_uid}/{sop_instance_uid}.webm"
+                content_type = "video/webm"
+                
+                if not convert_dicom_to_webm(
+                    task.dicom_path, 
+                    output_path, 
+                    metadata.get("RecommendedDisplayFrameRate", 50)
+                ):
+                    temp_files_to_cleanup.append(output_path)
+                    return ConversionResult(
+                        task_id=task.task_id,
+                        success=False,
+                        error="WebM conversion failed"
+                    )
+            else:
+                output_path = temp_output.name + ".jpeg"
+                s3_key = f"{folder_name}/{s3_prefix}{study_instance_uid}/{series_instance_uid}/{sop_instance_uid}.jpeg"
+                content_type = "image/jpeg"
+                
+                if not convert_dicom_to_jpeg(task.dicom_path, output_path):
+                    temp_files_to_cleanup.append(output_path)
+                    return ConversionResult(
+                        task_id=task.task_id,
+                        success=False,
+                        error="JPEG conversion failed"
+                    )
+            
+            # Clean up input DICOM file
+            try:
+                os.remove(task.dicom_path)
+            except OSError:
+                pass
+            
+            processing_time = time.time() - start_time
+            self.metrics.processing_times.append(processing_time)
+            # Keep only last 1000 times to prevent memory growth
+            if len(self.metrics.processing_times) > 1000:
+                self.metrics.processing_times = self.metrics.processing_times[-1000:]
+            
+            logging.info(f"Conversion completed for {task.task_id} in {processing_time:.2f}s")
+            
+            # Return success with output_path - DON'T clean up the output file yet
+            return ConversionResult(
+                task_id=task.task_id,
+                success=True,
+                output_path=output_path,
+                s3_key=s3_key,
+                content_type=content_type,
+                metadata=metadata
+            )
+            
+        except Exception as e:
+            logging.error(f"DICOM processing error for {task.task_id}: {e}")
+            return ConversionResult(
+                task_id=task.task_id,
+                success=False,
+                error=str(e)
+            )
+        finally:
+            # Only clean up temporary files on error, not the final output
+            for temp_file in temp_files_to_cleanup:
+                try:
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                except OSError:
+                    pass
+    
+    def _upload_to_s3(self, result: ConversionResult) -> tuple:
+        """Upload file to S3 with retry logic"""
+        if not result.success or not result.output_path:
+            return False, result
+        
+        # Check if file exists before attempting upload
+        if not os.path.exists(result.output_path):
+            logging.error(f"Converted file not found: {result.output_path}")
+            return False, result
+        
+        start_time = time.time()
+        s3_metadata = {key.lower(): str(value) for key, value in result.metadata.items()}
+        
+        try:
+            # Get file size for logging
+            file_size = os.path.getsize(result.output_path)
+            logging.debug(f"Starting S3 upload of {result.s3_key} ({file_size} bytes)")
+            
+            with open(result.output_path, 'rb') as f:
+                self.s3_client.upload_fileobj(
+                    f, 
+                    bucket, 
+                    result.s3_key,
+                    ExtraArgs={
+                        'ContentType': result.content_type, 
+                        'Metadata': s3_metadata
+                    }
+                )
+            
+            elapsed_time = time.time() - start_time
+            logging.info(f'S3 upload completed for {result.s3_key} in {elapsed_time:.2f}s')
+            
+            return True, result
+            
+        except FileNotFoundError as e:
+            logging.error(f'Converted file disappeared during upload: {result.output_path}')
+            return False, result
+        except Exception as e:
+            logging.error(f'S3 upload error for {result.s3_key}: {e}')
+            return False, result
+        finally:
+            # Always clean up converted file after upload attempt
+            try:
+                if os.path.exists(result.output_path):
+                    os.remove(result.output_path)
+                    logging.debug(f"Cleaned up converted file: {result.output_path}")
+            except OSError as e:
+                logging.warning(f"Failed to cleanup converted file {result.output_path}: {e}")
+    
+    def _create_api_payload(self, result: ConversionResult) -> dict:
+        """Create API payload from conversion result"""
+        metadata = result.metadata
+        return {
+            "patientDemographics": {
+                "PatientName": metadata.get("PatientName", "N/A"),
+                "PatientID": metadata.get("PatientID", "N/A"),
+                "PatientSex": metadata.get("PatientSex", "N/A"),
+                "PatientBirthDate": metadata.get("PatientBirthDate", "N/A"),
+                "StudyInstanceUID": metadata.get("StudyInstanceUID", "N/A"),
+                "SOPInstanceUID": metadata.get("SOPInstanceUID", "N/A"),
+                "SeriesInstanceUID": metadata.get("SeriesInstanceUID", "N/A"),
+                "StageName": metadata.get("StageName", "N/A"),
+                "View": metadata.get("View", "N/A"),
+                "InstanceNumber": metadata.get("InstanceNumber", "N/A"),
+                "SeriesNumber": metadata.get("SeriesNumber", "N/A"),
+            },
+            "s3Url": result.s3_key
+        }
+    
+    def _send_api_notification(self, payload: dict) -> bool:
+        """Send API notification with circuit breaker and retry logic"""
+        if not self.circuit_breaker.can_execute():
+            logging.warning("Circuit breaker open, skipping API call")
+            return False
+        
+        api_url = f"{backend_url}/common/uploadDicomFileFromECS"
+        
+        for attempt in range(api_retry_attempts):
+            try:
+                response = requests.post(
+                    api_url, 
+                    json=payload, 
+                    timeout=api_timeout
+                )
+                response.raise_for_status()
+                
+                logging.info(f"API notification sent successfully. Status: {response.status_code}")
+                return True
+                
+            except requests.exceptions.RequestException as e:
+                logging.warning(f"API notification attempt {attempt + 1} failed: {e}")
+                if attempt < api_retry_attempts - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+        
+        logging.error("All API notification attempts failed")
+        return False
+    
+    def shutdown(self):
+        """Graceful shutdown of all resources"""
+        logging.info("Initiating graceful shutdown...")
+        self._shutdown_event.set()
+        
+        # Wait for queues to empty
+        for queue in [self.conversion_queue, self.upload_queue, self.api_queue]:
+            queue.join()
+        
+        # Shutdown executors
+        for executor in [self.conversion_executor, self.upload_executor, self.api_executor]:
+            executor.shutdown(wait=True)
+        
+        logging.info("Shutdown complete")
+
+# Global resource manager instance
+resource_manager = None
 
 def get_dicom_fps(ds):
+    """Extract frame rate from DICOM metadata"""
     try:
         fps = None
 
-        # Check RecommendedDisplayFrameRate (0018,0040) → ds.RecommendedDisplayFrameRate
+        # Check RecommendedDisplayFrameRate (0018,0040)
         if "RecommendedDisplayFrameRate" in ds:
             try:
                 fps = int(ds.RecommendedDisplayFrameRate)
                 if fps > 0:
-                    print(f"📋 Found RecommendedDisplayFrameRate: {fps} FPS")
+                    logging.debug(f"Found RecommendedDisplayFrameRate: {fps} FPS")
                     return fps if fps >= 30 else 50
             except Exception:
                 pass
 
-        # Check FrameTime (0018,1063) → ds.FrameTime (milliseconds per frame)
+        # Check FrameTime (0018,1063) - milliseconds per frame
         if "FrameTime" in ds:
             try:
                 frame_time = float(ds.FrameTime)  # in ms
                 if frame_time > 0:
                     fps = round(1000 / frame_time)
-                    print(f"📋 Calculated FPS from FrameTime: {fps} FPS")
+                    logging.debug(f"Calculated FPS from FrameTime: {fps} FPS")
                     return fps if fps >= 30 else 50
             except Exception:
                 pass
 
         # Default fallback
-        print("⚠️ No FPS found in DICOM metadata, using default: 50 FPS")
+        logging.debug("No FPS found in DICOM metadata, using default: 50 FPS")
         return 50
 
     except Exception as e:
-        print(f"❌ Error reading DICOM FPS: {e}")
+        logging.warning(f"Error reading DICOM FPS: {e}")
         return 50
 
 def get_dicom_metadata(dicom_file):
@@ -133,9 +626,13 @@ def convert_dicom_to_jpeg(dicom_path, output_path):
     """Converts a single-frame DICOM to JPEG."""
     try:
         ds = dcmread(dicom_path)
+        if not hasattr(ds, 'pixel_array'):
+            logging.error(f"DICOM file {dicom_path} has no pixel data")
+            return False
+            
         img = Image.fromarray(ds.pixel_array)
-        img.save(output_path, "jpeg")
-        logging.info(f"Successfully converted {dicom_path} to {output_path}")
+        img.save(output_path, "JPEG", quality=95, optimize=True)
+        logging.debug(f"Successfully converted {dicom_path} to JPEG")
         return True
     except Exception as e:
         logging.error(f"Error converting DICOM to JPEG: {e}")
@@ -143,6 +640,7 @@ def convert_dicom_to_jpeg(dicom_path, output_path):
 
 def convert_dicom_to_webm(dicom_path, output_path, frame_rate=24):
     """Converts a multi-frame DICOM to WebM by extracting frames."""
+    temp_dir = None
     try:
         ds = dcmread(dicom_path)
         if not hasattr(ds, 'pixel_array') or ds.pixel_array.ndim < 3:
@@ -150,199 +648,149 @@ def convert_dicom_to_webm(dicom_path, output_path, frame_rate=24):
             return False
 
         temp_dir = tempfile.mkdtemp()
-        frame_paths = []
-
+        frame_pattern = os.path.join(temp_dir, "frame_%04d.png")
+        
+        # Extract frames more efficiently
         for i, frame in enumerate(ds.pixel_array):
             frame_path = os.path.join(temp_dir, f"frame_{i:04d}.png")
             img = Image.fromarray(frame)
-            img.save(frame_path, "png")
-            frame_paths.append(frame_path)
+            img.save(frame_path, "PNG", optimize=True)
 
-        # Use ffmpeg to combine frames into WebM
+        # Use ffmpeg to combine frames into WebM with optimized settings
         (
             ffmpeg
-            .input(os.path.join(temp_dir, "frame_%04d.png"), framerate=frame_rate)
-            .output(output_path, r=frame_rate, vcodec='libvpx-vp9', crf=23, preset='veryfast', pix_fmt='yuv420p', profile='0')\
+            .input(frame_pattern, framerate=frame_rate)
+            .output(
+                output_path,
+                r=frame_rate,
+                vcodec='libvpx-vp9',
+                crf=30,  # Slightly higher CRF for smaller files
+                preset='fast',  # Faster encoding
+                pix_fmt='yuv420p',
+                profile='0',
+                threads=2  # Limit threads to avoid resource contention
+            )
             .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
         )
-        logging.info(f"Successfully converted {dicom_path} to {output_path}")
+        logging.debug(f"Successfully converted {dicom_path} to WebM")
         return True
     except Exception as e:
         logging.error(f"Error converting DICOM to WebM: {e}")
         return False
     finally:
-        if 'temp_dir' in locals() and os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
-def process_and_upload(dicom_path):
-    """
-    Processes a DICOM file, converts it, and uploads it to S3.
-    """
-    metadata = get_dicom_metadata(dicom_path)
-    if not metadata:
-        return
-
-    sop_instance_uid = metadata.get("SOPInstanceUID", "unknown_sop")
-    series_instance_uid = metadata.get("SeriesInstanceUID", "unknown_series")
-    study_instance_uid = metadata.get("StudyInstanceUID", "unknown_study")
-    
-    # Get file size in MB
-    file_size_mb = os.path.getsize(dicom_path) / (1024 * 1024)
-    conversion_start_time = time.time()
-    logging.info(f"Starting conversion of {dicom_path} ({file_size_mb:.2f} MB), at {conversion_start_time}")
-
-    if add_studyuid_prefix:
-        s3_prefix = f"{dicom_prefix}{study_instance_uid}/"
-    else:
-        s3_prefix = dicom_prefix
-
-    with tempfile.NamedTemporaryFile(delete=False) as temp_output:
-        output_path = temp_output.name
-
-    if metadata.get("NumberOfFrames", 1) > 1:
-        output_path += ".webm"
-        s3_key = f"{folder_name}/{s3_prefix}{study_instance_uid}/{series_instance_uid}/{sop_instance_uid}.webm"
-        content_type = "video/webm"
-        if not convert_dicom_to_webm(dicom_path, output_path, metadata.get("RecommendedDisplayFrameRate")):
-            return
-    else:
-        output_path += ".jpeg"
-        s3_key = f"{folder_name}/{s3_prefix}{study_instance_uid}/{series_instance_uid}/{sop_instance_uid}.jpeg"
-        content_type = "image/jpeg"
-        if not convert_dicom_to_jpeg(dicom_path, output_path):
-            return
-    
-    conversion_end_time = time.time()
-    conversion_time = conversion_end_time - conversion_start_time
-    logging.info(f"Total conversion time: {conversion_time} seconds")
-
-    s3_metadata = {key.lower(): str(value) for key, value in metadata.items()}
-    
-    executor.submit(s3_upload, output_path, bucket, s3_key, content_type, s3_metadata)
-
-    # Log patient demographics and S3 URL
-    patient_name = metadata.get("PatientName", "N/A")
-    patient_id = metadata.get("PatientID", "N/A")
-    s3_url = f"{s3_key}"
-    logging.info(f"Processed DICOM for Patient: {patient_name} (ID: {patient_id}), study Instance UID: {study_instance_uid}, SOP Instance UID: {sop_instance_uid}. Uploaded to S3: {s3_url}")
-
-    # Prepare payload for POST API
-    api_payload = {
-        "patientDemographics": {
-            "PatientName": patient_name,
-            "PatientID": patient_id,
-            "PatientSex": metadata.get("PatientSex", "N/A"),
-            "PatientBirthDate": metadata.get("PatientBirthDate", "N/A"),
-            "StudyInstanceUID": study_instance_uid,
-            "SOPInstanceUID": sop_instance_uid,
-            "SeriesInstanceUID": metadata.get("SeriesInstanceUID", "N/A"),
-            "StageName": metadata.get("StageName", "N/A"),
-            "View": metadata.get("View", "N/A"),
-            "InstanceNumber": metadata.get("InstanceNumber", "N/A"),
-            "SeriesNumber": metadata.get("SeriesNumber", "N/A"),
-        },
-        "s3Url": s3_url
-    }
-
-    # Make POST request to the API
-    api_url = f"{backend_url}/common/uploadDicomFileFromECS"
-    try:
-        response = requests.post(api_url, json=api_payload)
-        response.raise_for_status()  # Raise an exception for HTTP errors (4xx or 5xx)
-        logging.info(f"Successfully sent data to API. Status: {response.status_code}, Response: {response.text}")
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error sending data to API: {e}")
-
-# Implement a handler for evt.EVT_C_STORE
 def handle_store(event):
-    """Handle a C-STORE request event."""
-    storing_start_time = time.time()
-    logging.info(f"Starting at: {storing_start_time}")
+    """Handle a C-STORE request event with improved error handling and flow control."""
+    global resource_manager
+    
+    start_time = time.time()
     
     # Check if the received file is a Structured Report
     sop_class_uid = event.file_meta.MediaStorageSOPClassUID
     if "1.2.840.10008.5.1.4.1.1.88" in sop_class_uid:
-        logging.info(f"Received a Structured Report (SOP Class UID: {sop_class_uid}). Skipping conversion.")
+        logging.info(f"Received Structured Report (SOP Class UID: {sop_class_uid}). Skipping conversion.")
         return 0x0000
-
+    
+    # Check system capacity before accepting
+    if not resource_manager.can_accept_task():
+        logging.warning("System at capacity, rejecting C-STORE request")
+        return 0xA700  # Out of resources
+    
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".dcm") as temp_dicom:
-            # write raw without decoding
-            # https://pydicom.github.io/pynetdicom/stable/examples/storage.html
-            # https://github.com/pydicom/pynetdicom/issues/367
-            # Write the preamble, prefix, file meta, encoded dataset
-            temp_dicom.write(b'\x00' * 128)
-            temp_dicom.write(b'DICM')
+        # Create temporary DICOM file
+        temp_dicom = tempfile.NamedTemporaryFile(delete=False, suffix=".dcm")
+        try:
+            # Write DICOM data efficiently
+            temp_dicom.write(b'\x00' * 128)  # Preamble
+            temp_dicom.write(b'DICM')        # Prefix
             write_file_meta_info(temp_dicom, event.file_meta)
             temp_dicom.write(event.request.DataSet.getvalue())
-            
             temp_dicom_path = temp_dicom.name
-
-        process_and_upload(temp_dicom_path)
+        finally:
+            temp_dicom.close()
         
-        # optional c-store delay, can be used as a front-end throttling mechanism
-        if cstore_delay_ms or cstore_delay_ms!=0:
-            logging.info(f'Injecting C-STORE delay: {cstore_delay_ms} ms')
-            time.sleep(int(cstore_delay_ms) / 1000)
-            
-        storing_end_time = time.time()
-        storing_elapsed_time = storing_end_time - storing_start_time
+        # Create processing task
+        task = ProcessingTask(
+            dicom_path=temp_dicom_path,
+            task_id=f"{int(start_time * 1000)}_{threading.current_thread().ident}",
+            created_at=start_time
+        )
+        
+        # Submit task to processing pipeline
+        if not resource_manager.submit_task(task):
+            # Clean up on failure to submit
+            try:
+                os.remove(temp_dicom_path)
+            except OSError:
+                pass
+            logging.warning("Failed to submit task to processing queue")
+            return 0xA700  # Out of resources
+        
+        # Optional C-STORE delay for throttling
+        if cstore_delay_ms > 0:
+            time.sleep(cstore_delay_ms / 1000)
+        
+        processing_time = time.time() - start_time
+        logging.info(f'DICOM instance received and queued for processing in {processing_time:.3f}s')
+        
+        return 0x0000  # Success
+        
+    except Exception as e:
+        logging.error(f'Error in C-STORE processing: {e}')
+        return 0xC211  # Processing failure
 
-        logging.info(f'Total time taken to convert and store: {storing_elapsed_time:.2f} seconds')
-    except BaseException as e:
-        logging.error(f'Error in C-STORE processing. {e}')
-        return 0xC211
-    
-    # return success after instance is received and written to memory
-    return 0x0000
-           
-def s3_upload(file_path, bucket, key, content_type, metadata):    
-    start_time = time.time()
-    logging.debug(f'Starting s3 upload of {key}')
-
-    try:
-        with open(file_path, 'rb') as f:
-            s3client.upload_fileobj(f, bucket, key, ExtraArgs={'ContentType': content_type, 'Metadata': metadata})
-    except BaseException as e:
-        logging.error(f'Error in S3 upload. {e}')
-        return False
-    finally:
-        os.remove(file_path)
-
-    elapsed_time = time.time() - start_time
-    logging.info(f'Finished s3 upload of {key} in {elapsed_time} s')
-
-    return True
-
-def json_dumps_compact(data):
-    return json.dumps(data, separators=(',',':'), sort_keys=True)
-    
 def main():
-
-    logging.warning(f'Starting application.')
-    logging.warning(f'Environment: {env}')
-          
-    # handlers = [    (evt.EVT_C_STORE, handle_store, [os.getcwd()+'/out']), (evt.EVT_CONN_OPEN , handle_open), (evt.EVT_ACCEPTED , handle_accepted), (evt.EVT_RELEASED  , handle_assoc_close ) , (evt.EVT_ABORTED  , handle_assoc_close )]       
-    handlers = [(evt.EVT_C_STORE, handle_store)]
-
-    # Initialise the Application Entity
-    ae = AE()
-    # overwrite AE defaults as per configuration
-    ae.maximum_pdu_size = maximum_pdu_size
-    ae.dimse_timeout = dimse_timeout
-    ae.maximum_associations = maximum_associations
-    ae.network_timeout = network_timeout
+    global resource_manager
     
-    # Support presentation contexts for all storage SOP Classes
-    supported_contexts = AllStoragePresentationContexts
-    for context in supported_contexts:
-        context.TransferSyntax = ['*']
-    ae.supported_contexts = supported_contexts
-    # enable verification
-    ae.add_supported_context(Verification)
-    # Start listening for incoming association requests
-    logging.warning(f'Starting SCP Listener on port {scp_port}')
-    scp = ae.start_server(("", scp_port), evt_handlers=handlers)
+    logging.warning('Starting DICOM C-STORE application...')
+    logging.warning(f'Configuration: conversion_workers={conversion_workers}, '
+                   f's3_upload_workers={s3_upload_workers}, api_workers={api_workers}, '
+                   f'max_queue_size={max_queue_size}, max_concurrent_processing={max_concurrent_processing}')
+    
+    # Initialize resource manager
+    resource_manager = ResourceManager()
+    
+    try:
+        # Setup event handlers
+        handlers = [(evt.EVT_C_STORE, handle_store)]
+
+        # Initialize the Application Entity
+        ae = AE()
+        ae.maximum_pdu_size = maximum_pdu_size
+        ae.dimse_timeout = dimse_timeout
+        ae.maximum_associations = maximum_associations
+        ae.network_timeout = network_timeout
+        
+        # Support presentation contexts for all storage SOP Classes
+        supported_contexts = AllStoragePresentationContexts
+        for context in supported_contexts:
+            context.TransferSyntax = ['*']
+        ae.supported_contexts = supported_contexts
+        
+        # Enable verification
+        ae.add_supported_context(Verification)
+        
+        # Start listening for incoming association requests
+        logging.warning(f'Starting SCP Listener on port {scp_port}')
+        scp = ae.start_server(("", scp_port), evt_handlers=handlers)
+        
+        # Keep the main thread alive
+        try:
+            while True:
+                time.sleep(60)  # Sleep and let background threads do the work
+        except KeyboardInterrupt:
+            logging.info("Received shutdown signal")
+        
+    except Exception as e:
+        logging.error(f"Fatal error in main: {e}")
+        raise
+    finally:
+        # Cleanup
+        if resource_manager:
+            resource_manager.shutdown()
+        logging.warning("Application shutdown complete")
 
 if __name__ == "__main__":
     main()

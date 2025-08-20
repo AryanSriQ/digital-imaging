@@ -258,7 +258,13 @@ def handle_store(event):
     """Handle a C-STORE request event."""
     storing_start_time = time.time()
     logging.info(f"Starting at: {storing_start_time}")
- 
+    
+    # Check if the received file is a Structured Report
+    sop_class_uid = event.file_meta.MediaStorageSOPClassUID
+    if "1.2.840.10008.5.1.4.1.1.88" in sop_class_uid:
+        logging.info(f"Received a Structured Report (SOP Class UID: {sop_class_uid}). Skipping conversion.")
+        return 0x0000
+
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".dcm") as temp_dicom:
             # write raw without decoding
@@ -328,7 +334,10 @@ def main():
     ae.network_timeout = network_timeout
     
     # Support presentation contexts for all storage SOP Classes
-    ae.supported_contexts = AllStoragePresentationContexts
+    supported_contexts = AllStoragePresentationContexts
+    for context in supported_contexts:
+        context.TransferSyntax = ['*']
+    ae.supported_contexts = supported_contexts
     # enable verification
     ae.add_supported_context(Verification)
     # Start listening for incoming association requests

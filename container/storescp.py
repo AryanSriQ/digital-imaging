@@ -759,10 +759,6 @@ def handle_store(event):
         logging.error(f'Error in C-STORE processing: {e}')
         return 0xC211  # Processing failure
 
-def accept_all_contexts(context):
-    """Accept any SOP Class and all proposed transfer syntaxes."""
-    return context.as_acceptor()
-
 def main():
     global resource_manager
     
@@ -785,44 +781,42 @@ def main():
         ae.maximum_associations = maximum_associations
         ae.network_timeout = network_timeout
 
-        ae.on_accept_context = accept_all_contexts
-        
         # Support presentation contexts for all storage SOP Classes
-        # supported_contexts = AllStoragePresentationContexts
+        supported_contexts = AllStoragePresentationContexts
         
         # Add missing presentation contexts
-        # supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.2.2.2'))
-        # supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.130'))
-        # supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.6'))
-        # # supported_contexts.append(build_context(ThreeDRenderingAndSegmentationDefaults))
-        # supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.3.1'))
-        # supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.3'))
-        # supported_contexts.append(build_context('1.2.840.10008.1.20.1'))
-        # supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.7.4'))
-        # supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.2.2.1'))
-        # # supported_contexts.append(build_context(Private3DPresentationState))
-        # # Missing SOP Classes
-        # supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.2.2.1'))  # Study Root Query/Retrieve - FIND
-        # supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.2.2.2'))  # Study Root Query/Retrieve - MOVE
-        # supported_contexts.append(build_context('1.2.840.10008.1.1'))            # Verification SOP Class
-        # supported_contexts.append(build_context('1.2.840.10008.1.20.1'))         # Storage Commitment Push Model
-        # supported_contexts.append(build_context('1.2.840.10008.1.20.1.1'))       # Storage Commitment Push Model - SOP Instance
-        # supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.66.4')) # Segmentation Storage
-        # supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.130'))  # Volume Surface Mesh Storage (closest official, may differ if you meant "Volume Set")
-        # supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.6.1'))  # Ultrasound Image Storage (Retired)
-        # supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.3.1'))  # Ultrasound Multi-frame Image Storage (Retired)
+        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.2.2.2'))
+        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.130'))
+        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.6'))
+        # supported_contexts.append(build_context(ThreeDRenderingAndSegmentationDefaults))
+        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.3.1'))
+        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.3'))
+        supported_contexts.append(build_context('1.2.840.10008.1.20.1'))
+        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.7.4'))
+        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.2.2.1'))
+        # supported_contexts.append(build_context(Private3DPresentationState))
+        # Missing SOP Classes
+        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.2.2.1'))  # Study Root Query/Retrieve - FIND
+        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.2.2.2'))  # Study Root Query/Retrieve - MOVE
+        supported_contexts.append(build_context('1.2.840.10008.1.1'))            # Verification SOP Class
+        supported_contexts.append(build_context('1.2.840.10008.1.20.1'))         # Storage Commitment Push Model
+        supported_contexts.append(build_context('1.2.840.10008.1.20.1.1'))       # Storage Commitment Push Model - SOP Instance
+        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.66.4')) # Segmentation Storage
+        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.130'))  # Volume Surface Mesh Storage (closest official, may differ if you meant "Volume Set")
+        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.6.1'))  # Ultrasound Image Storage (Retired)
+        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.3.1'))  # Ultrasound Multi-frame Image Storage (Retired)
         # Private SOP Classes like "Private 3D Presentation State" require vendor-specific UID
 
-        # for context in supported_contexts:
-        #     context.transfer_syntax = [
-        #         '1.2.840.10008.1.2.1',  # Explicit VR Little Endian
-        #         '1.2.840.10008.1.2',    # Implicit VR Little Endian
-        #         '1.2.840.10008.1.2.2',  # Explicit VR Big Endian
-        #     ]
-        # ae.supported_contexts = supported_contexts
+        for context in supported_contexts:
+            context.transfer_syntax = [
+                '1.2.840.10008.1.2.1',  # Explicit VR Little Endian
+                '1.2.840.10008.1.2',    # Implicit VR Little Endian
+                '1.2.840.10008.1.2.2',  # Explicit VR Big Endian
+            ]
+        ae.supported_contexts = supported_contexts
         
         # Enable verification
-        # ae.add_supported_context(Verification)
+        ae.add_supported_context(Verification)
         
         # Start listening for incoming association requests
         logging.warning(f'Starting SCP Listener on port {scp_port}')

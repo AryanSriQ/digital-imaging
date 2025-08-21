@@ -21,6 +21,7 @@ from PIL import Image
 from environs import Env
 from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 import weakref
+import numpy as np
 
 import boto3
 import botocore
@@ -333,9 +334,9 @@ class ResourceManager:
         """Handle conversion completion"""
         try:
             result = future.result()
+            self.metrics.total_processed_size += result.dicom_size
             if result.success:
                 self.metrics.total_processed += 1
-                self.metrics.total_processed_size += result.dicom_size
                 self.upload_queue.put_nowait(result)
             else:
                 self.metrics.total_failed += 1
@@ -664,8 +665,29 @@ def convert_dicom_to_jpeg(dicom_path, output_path):
         if not hasattr(ds, 'pixel_array'):
             logging.error(f"DICOM file {dicom_path} has no pixel data")
             return False
-            
-        img = Image.fromarray(ds.pixel_array)
+        pixel_array = ds.pixel_array
+        # Handle 16-bit images by converting to 8-bit
+        if pixel_array.dtype == np.uint16 or pixel_array.dtype == np.int16:
+            # Normalize to 0-255 range for 8-bit JPEG
+            # Method 1: Simple linear scaling
+            pixel_min = pixel_array.min()
+            pixel_max = pixel_array.max()
+            if pixel_max > pixel_min:
+                # Scale to 0-255
+                pixel_array = ((pixel_array - pixel_min) / (pixel_max - pixel_min) * 255).astype(np.uint8)
+            else:
+                # Handle edge case where all pixels have same value
+                pixel_array = np.zeros_like(pixel_array, dtype=np.uint8)
+        # Convert to PIL Image
+        img = Image.fromarray(pixel_array)
+        # Ensure we're in a JPEG-compatible mode
+        if img.mode not in ['L', 'RGB', 'CMYK']:
+            if img.mode == 'I' or img.mode == 'I;16':
+                # Convert 16-bit integer to 8-bit grayscale
+                img = img.convert('L')
+            elif img.mode in ['P', 'RGBA']:
+                # Convert palette or RGBA to RGB
+                img = img.convert('RGB')
         img.save(output_path, "JPEG", quality=95, optimize=True)
         logging.debug(f"Successfully converted {dicom_path} to JPEG")
         return True

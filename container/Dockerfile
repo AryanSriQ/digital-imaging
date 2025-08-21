@@ -30,7 +30,8 @@ RUN pip install --no-cache-dir \
     Pillow \
     numpy \
     requests \
-    aiohttp
+    aiohttp \
+    numpy
 
 WORKDIR /app
 

@@ -116,6 +116,7 @@ class ConversionResult:
     content_type: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    dicom_size: int = 0
 
 @dataclass
 class ProcessingMetrics:
@@ -334,6 +335,7 @@ class ResourceManager:
             result = future.result()
             if result.success:
                 self.metrics.total_processed += 1
+                self.metrics.total_processed_size += result.dicom_size
                 self.upload_queue.put_nowait(result)
             else:
                 self.metrics.total_failed += 1
@@ -377,15 +379,20 @@ class ResourceManager:
         """Process DICOM file with proper error handling and cleanup"""
         start_time = time.time()
         temp_files_to_cleanup = []  # Only for cleanup on error
+        dicom_size = 0
         
         try:
+            # Get DICOM file size
+            if os.path.exists(task.dicom_path):
+                dicom_size = os.path.getsize(task.dicom_path)
             # Extract metadata first
             metadata = get_dicom_metadata(task.dicom_path)
             if not metadata:
                 return ConversionResult(
                     task_id=task.task_id,
                     success=False,
-                    error="Failed to extract DICOM metadata"
+                    error="Failed to extract DICOM metadata",
+                    dicom_size=dicom_size
                 )
             
             # Determine conversion type and paths
@@ -418,7 +425,8 @@ class ResourceManager:
                     return ConversionResult(
                         task_id=task.task_id,
                         success=False,
-                        error="WebM conversion failed"
+                        error="WebM conversion failed",
+                        dicom_size=dicom_size
                     )
             else:
                 output_path = temp_output.name + ".jpeg"
@@ -430,7 +438,8 @@ class ResourceManager:
                     return ConversionResult(
                         task_id=task.task_id,
                         success=False,
-                        error="JPEG conversion failed"
+                        error="JPEG conversion failed",
+                        dicom_size=dicom_size
                     )
             
             # Clean up input DICOM file
@@ -454,7 +463,8 @@ class ResourceManager:
                 output_path=output_path,
                 s3_key=s3_key,
                 content_type=content_type,
-                metadata=metadata
+                metadata=metadata,
+                dicom_size=dicom_size
             )
             
         except Exception as e:
@@ -462,7 +472,8 @@ class ResourceManager:
             return ConversionResult(
                 task_id=task.task_id,
                 success=False,
-                error=str(e)
+                error=str(e),
+                dicom_size=dicom_size
             )
         finally:
             # Only clean up temporary files on error, not the final output
@@ -489,7 +500,6 @@ class ResourceManager:
         try:
             # Get file size for logging
             file_size = os.path.getsize(result.output_path)
-            self.metrics.total_processed_size += file_size
             logging.debug(f"Starting S3 upload of {result.s3_key} ({file_size} bytes)")
             
             with open(result.output_path, 'rb') as f:

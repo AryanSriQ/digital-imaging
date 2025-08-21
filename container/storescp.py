@@ -28,21 +28,21 @@ from pynetdicom import AE, evt, AllStoragePresentationContexts, debug_logger, bu
 from pynetdicom.service_class import StorageServiceClass
 
 # Register the private SOP Class
-private_uid = '1.3.46.670589.2.5.1.1'
-register_uid(private_uid, 'Private3DPresentationState', StorageServiceClass)
+# private_uid = '1.3.46.670589.2.5.1.1'
+# register_uid(private_uid, 'Private3DPresentationState', StorageServiceClass)
 
 from pynetdicom.sop_class import (
     Verification,
-    StudyRootQueryRetrieveInformationModelMove,
-    VolumeSetStorage,
-    UltrasoundImageStorageRetired,
-    ThreeDRenderingAndSegmentationDefaults,
-    UltrasoundMultiframeImageStorage,
-    UltrasoundMultiframeImageStorageRetired,
-    StorageCommitmentPushModel,
-    MultiframeTrueColorSecondaryCaptureImageStorage,
-    StudyRootQueryRetrieveInformationModelFind,
-    Private3DPresentationState,
+    # StudyRootQueryRetrieveInformationModelMove,
+    # VolumeSetStorage,
+    # UltrasoundImageStorageRetired,
+    # ThreeDRenderingAndSegmentationDefaults,
+    # UltrasoundMultiframeImageStorage,
+    # UltrasoundMultiframeImageStorageRetired,
+    # StorageCommitmentPushModel,
+    # MultiframeTrueColorSecondaryCaptureImageStorage,
+    # StudyRootQueryRetrieveInformationModelFind,
+    # Private3DPresentationState,
 )
 from pydicom.filewriter import write_file_meta_info
 from pydicom.filereader import dcmread
@@ -785,16 +785,16 @@ def main():
         supported_contexts = AllStoragePresentationContexts
         
         # Add missing presentation contexts
-        supported_contexts.append(build_context(StudyRootQueryRetrieveInformationModelMove))
-        supported_contexts.append(build_context(VolumeSetStorage))
-        supported_contexts.append(build_context(UltrasoundImageStorageRetired))
-        supported_contexts.append(build_context(ThreeDRenderingAndSegmentationDefaults))
-        supported_contexts.append(build_context(UltrasoundMultiframeImageStorage))
-        supported_contexts.append(build_context(UltrasoundMultiframeImageStorageRetired))
-        supported_contexts.append(build_context(StorageCommitmentPushModel))
-        supported_contexts.append(build_context(MultiframeTrueColorSecondaryCaptureImageStorage))
-        supported_contexts.append(build_context(StudyRootQueryRetrieveInformationModelFind))
-        supported_contexts.append(build_context(Private3DPresentationState))
+        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.2.2.2'))
+        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.130'))
+        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.6'))
+        # supported_contexts.append(build_context(ThreeDRenderingAndSegmentationDefaults))
+        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.3.1'))
+        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.3'))
+        supported_contexts.append(build_context('1.2.840.10008.1.20.1'))
+        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.7.4'))
+        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.2.2.1'))
+        # supported_contexts.append(build_context(Private3DPresentationState))
 
         for context in supported_contexts:
             context.transfer_syntax = [

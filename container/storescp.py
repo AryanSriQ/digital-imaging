@@ -24,8 +24,26 @@ import weakref
 
 import boto3
 import botocore
-from pynetdicom import AE, evt, AllStoragePresentationContexts, debug_logger
-from pynetdicom.sop_class import Verification
+from pynetdicom import AE, evt, AllStoragePresentationContexts, debug_logger, build_context, register_uid
+from pynetdicom.service_class import StorageServiceClass
+
+# Register the private SOP Class
+private_uid = '1.3.46.670589.2.5.1.1'
+register_uid(private_uid, 'Private3DPresentationState', StorageServiceClass)
+
+from pynetdicom.sop_class import (
+    Verification,
+    StudyRootQueryRetrieveInformationModelMove,
+    VolumeSetStorage,
+    UltrasoundImageStorageRetired,
+    ThreeDRenderingAndSegmentationDefaults,
+    UltrasoundMultiframeImageStorage,
+    UltrasoundMultiframeImageStorageRetired,
+    StorageCommitmentPushModel,
+    MultiframeTrueColorSecondaryCaptureImageStorage,
+    StudyRootQueryRetrieveInformationModelFind,
+    Private3DPresentationState,
+)
 from pydicom.filewriter import write_file_meta_info
 from pydicom.filereader import dcmread
 
@@ -765,8 +783,25 @@ def main():
         
         # Support presentation contexts for all storage SOP Classes
         supported_contexts = AllStoragePresentationContexts
+        
+        # Add missing presentation contexts
+        supported_contexts.append(build_context(StudyRootQueryRetrieveInformationModelMove))
+        supported_contexts.append(build_context(VolumeSetStorage))
+        supported_contexts.append(build_context(UltrasoundImageStorageRetired))
+        supported_contexts.append(build_context(ThreeDRenderingAndSegmentationDefaults))
+        supported_contexts.append(build_context(UltrasoundMultiframeImageStorage))
+        supported_contexts.append(build_context(UltrasoundMultiframeImageStorageRetired))
+        supported_contexts.append(build_context(StorageCommitmentPushModel))
+        supported_contexts.append(build_context(MultiframeTrueColorSecondaryCaptureImageStorage))
+        supported_contexts.append(build_context(StudyRootQueryRetrieveInformationModelFind))
+        supported_contexts.append(build_context(Private3DPresentationState))
+
         for context in supported_contexts:
-            context.TransferSyntax = ['*']
+            context.transfer_syntax = [
+                '1.2.840.10008.1.2.1',  # Explicit VR Little Endian
+                '1.2.840.10008.1.2',    # Implicit VR Little Endian
+                '1.2.840.10008.1.2.2',  # Explicit VR Big Endian
+            ]
         ae.supported_contexts = supported_contexts
         
         # Enable verification

@@ -129,6 +129,8 @@ class ProcessingMetrics:
     api_failures: int = 0
     queue_depth: int = 0
     processing_times: list = None
+    total_received_size: int = 0
+    total_processed_size: int = 0
     
     def __post_init__(self):
         if self.processing_times is None:
@@ -256,11 +258,15 @@ class ResourceManager:
     def _log_metrics(self):
         """Log current processing metrics"""
         m = self.metrics
+        total_size_left_to_process = m.total_received_size - m.total_processed_size
         logging.info(
             f"Metrics - Received: {m.total_received}, Processed: {m.total_processed}, "
             f"Failed: {m.total_failed}, Queue depth: {m.queue_depth}, "
             f"Upload success: {m.total_uploaded}, Upload failures: {m.upload_failures}, "
-            f"API success: {m.api_successes}, API failures: {m.api_failures}"
+            f"API success: {m.api_successes}, API failures: {m.api_failures}, "
+            f"Total size of processed files: {m.total_processed_size}, "
+            f"Total size of received files: {m.total_received_size}, "
+            f"Total size of files left to process: {total_size_left_to_process}"
         )
     
     def can_accept_task(self) -> bool:
@@ -483,6 +489,7 @@ class ResourceManager:
         try:
             # Get file size for logging
             file_size = os.path.getsize(result.output_path)
+            self.metrics.total_processed_size += file_size
             logging.debug(f"Starting S3 upload of {result.s3_key} ({file_size} bytes)")
             
             with open(result.output_path, 'rb') as f:
@@ -726,6 +733,9 @@ def handle_store(event):
             write_file_meta_info(temp_dicom, event.file_meta)
             temp_dicom.write(event.request.DataSet.getvalue())
             temp_dicom_path = temp_dicom.name
+            # Get file size
+            file_size = os.path.getsize(temp_dicom_path)
+            resource_manager.metrics.total_received_size += file_size
         finally:
             temp_dicom.close()
         

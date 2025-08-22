@@ -210,6 +210,16 @@ class ResourceManager:
                 retries={'max_attempts': 3, 'mode': 'adaptive'}
             )
         )
+
+        # Create S3 client for the new bucket
+        self.s3_client_dicom = boto3.client(
+            's3',
+            region_name='ap-southeast-2',
+            config=botocore.client.Config(
+                max_pool_connections=boto_max_pool_connections,
+                retries={'max_attempts': 3, 'mode': 'adaptive'}
+            )
+        )
         
         # Start worker threads
         self._start_workers()
@@ -379,6 +389,39 @@ class ResourceManager:
     def _process_dicom(self, task: ProcessingTask) -> ConversionResult:
         """Process DICOM file with proper error handling and cleanup"""
         start_time = time.time()
+
+        # # BEGIN: Added logic to save DICOM to a specific path
+        # try:
+        #     # Read the DICOM dataset
+        #     ds = dcmread(task.dicom_path)
+
+        #     # Extract UIDs for the new path
+        #     study_instance_uid = str(ds.StudyInstanceUID)
+        #     series_instance_uid = str(ds.SeriesInstanceUID)
+        #     sop_instance_uid = str(ds.SOPInstanceUID)
+
+        #     # Get s3_prefix from environment
+        #     s3_prefix = os.environ.get("S3_PREFIX", "")
+
+        #     # Construct the new path and filename
+        #     new_path = os.path.join("echo-dicom-s3", f"{s3_prefix}{study_instance_uid}", series_instance_uid)
+        #     new_filename = f"{sop_instance_uid}.dcm"
+        #     full_path = os.path.join(new_path, new_filename)
+
+        #     # Create intermediate directories if they don't exist
+        #     os.makedirs(new_path, exist_ok=True)
+
+        #     # Save the dataset to the new path
+        #     ds.save_as(full_path, write_like_original=False)
+        #     logging.info(f"DICOM file saved to: {full_path}")
+
+        #     # Upload the DICOM file to S3
+        #     s3_key = f"{s3_prefix}{study_instance_uid}/{series_instance_uid}/{sop_instance_uid}.dcm"
+        #     self._upload_dicom_to_s3(full_path, s3_key)
+        # except Exception as e:
+        #     logging.error(f"Failed to save DICOM to the new path: {e}")
+        # # END: Added logic
+
         temp_files_to_cleanup = []  # Only for cleanup on error
         dicom_size = 0
         
@@ -581,6 +624,40 @@ class ResourceManager:
         
         logging.error("All API notification attempts failed")
         return False
+
+    # def _upload_dicom_to_s3(self, file_path: str, s3_key: str) -> bool:
+    #     """Upload DICOM file to S3 with retry logic"""
+
+    #     # Check if file exists before attempting upload
+    #     if not os.path.exists(file_path):
+    #         logging.error(f"DICOM file not found: {file_path}")
+    #         return False
+
+    #     start_time = time.time()
+
+    #     try:
+    #         # Get file size for logging
+    #         file_size = os.path.getsize(file_path)
+    #         logging.debug(f"Starting S3 upload of {s3_key} ({file_size} bytes) to echo-dicom-s3 bucket")
+
+    #         with open(file_path, 'rb') as f:
+    #             self.s3_client_dicom.upload_fileobj(
+    #                 f, 
+    #                 "echo-dicom-s3", 
+    #                 s3_key
+    #             )
+
+    #         elapsed_time = time.time() - start_time
+    #         logging.info(f'S3 upload completed for {s3_key} in {elapsed_time:.2f}s to echo-dicom-s3 bucket')
+
+    #         return True
+
+    #     except FileNotFoundError as e:
+    #         logging.error(f'DICOM file disappeared during upload: {file_path}')
+    #         return False
+    #     except Exception as e:
+    #         logging.error(f'S3 upload error for {s3_key} to echo-dicom-s3 bucket: {e}')
+    #         return False
     
     def shutdown(self):
         """Graceful shutdown of all resources"""
@@ -814,7 +891,7 @@ def main():
     
     try:
         # Setup event handlers
-        handlers = [(evt.EVT_C_STORE, handle_store)]
+        handlers = [(evt.EVT_C_STORE, handle_store), (evt.EVT_C_ECHO, lambda event: 0x0000)]
 
         # Initialize the Application Entity
         ae = AE()
@@ -827,7 +904,6 @@ def main():
         supported_contexts = AllStoragePresentationContexts
         
         # Add missing presentation contexts
-        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.2.2.2'))
         supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.130'))
         supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.6'))
         # supported_contexts.append(build_context(ThreeDRenderingAndSegmentationDefaults))
@@ -835,14 +911,9 @@ def main():
         supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.3'))
         supported_contexts.append(build_context('1.2.840.10008.1.20.1'))
         supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.7.4'))
-        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.2.2.1'))
         # supported_contexts.append(build_context(Private3DPresentationState))
         # Missing SOP Classes
-        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.2.2.1'))  # Study Root Query/Retrieve - FIND
-        supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.2.2.2'))  # Study Root Query/Retrieve - MOVE
         supported_contexts.append(build_context('1.2.840.10008.1.1'))            # Verification SOP Class
-        supported_contexts.append(build_context('1.2.840.10008.1.20.1'))         # Storage Commitment Push Model
-        supported_contexts.append(build_context('1.2.840.10008.1.20.1.1'))       # Storage Commitment Push Model - SOP Instance
         supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.66.4')) # Segmentation Storage
         supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.130'))  # Volume Surface Mesh Storage (closest official, may differ if you meant "Volume Set")
         supported_contexts.append(build_context('1.2.840.10008.5.1.4.1.1.6.1'))  # Ultrasound Image Storage (Retired)
@@ -851,9 +922,24 @@ def main():
 
         for context in supported_contexts:
             context.transfer_syntax = [
-                '1.2.840.10008.1.2.1',  # Explicit VR Little Endian
-                '1.2.840.10008.1.2',    # Implicit VR Little Endian
-                '1.2.840.10008.1.2.2',  # Explicit VR Big Endian
+                '1.2.840.10008.1.2',      # Implicit VR Little Endian
+                '1.2.840.10008.1.2.1',    # Explicit VR Little Endian
+                '1.2.840.10008.1.2.2',    # Explicit VR Big Endian
+                '1.2.840.10008.1.2.5',    # RLE Lossless
+                '1.2.840.10008.1.2.4.50', # JPEG Baseline (Process 1)
+                '1.2.840.10008.1.2.4.57', # JPEG Lossless, Non-Hierarchical (Process 14)
+                '1.2.840.10008.1.2.4.70', # JPEG Lossless, SV1
+                '1.2.840.10008.1.2.4.80', # JPEG-LS Lossless
+                '1.2.840.10008.1.2.4.81', # JPEG-LS Near-Lossless
+                '1.2.840.10008.1.2.4.90', # JPEG 2000 Lossless
+                '1.2.840.10008.1.2.4.91', # JPEG 2000
+                '1.2.840.10008.1.2.4.92', # MPEG2 MP@ML
+                '1.2.840.10008.1.2.4.93', # MPEG2 MP@HL
+                '1.2.840.10008.1.2.4.102',# MPEG-4 AVC/H.264 BD Compatible
+                '1.2.840.10008.1.2.4.103',# MPEG-4 AVC/H.264 High Profile
+                # add HEVC/H.265 if your devices use it:
+                '1.2.840.10008.1.2.4.108',# HEVC/H.265 Main Profile
+                '1.2.840.10008.1.2.4.109',# HEVC/H.265 Main 10 Profile
             ]
         ae.supported_contexts = supported_contexts
         

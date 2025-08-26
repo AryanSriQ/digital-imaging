@@ -22,6 +22,7 @@ from environs import Env
 from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 import weakref
 import numpy as np
+import multiprocessing
 
 import boto3
 import botocore
@@ -34,19 +35,60 @@ from pynetdicom.service_class import StorageServiceClass
 
 from pynetdicom.sop_class import (
     Verification,
-    # StudyRootQueryRetrieveInformationModelMove,
-    # VolumeSetStorage,
-    # UltrasoundImageStorageRetired,
-    # ThreeDRenderingAndSegmentationDefaults,
-    # UltrasoundMultiframeImageStorage,
-    # UltrasoundMultiframeImageStorageRetired,
-    # StorageCommitmentPushModel,
-    # MultiframeTrueColorSecondaryCaptureImageStorage,
-    # StudyRootQueryRetrieveInformationModelFind,
-    # Private3DPresentationState,
 )
 from pydicom.filewriter import write_file_meta_info
 from pydicom.filereader import dcmread
+from pydicom.uid import (
+    UID,
+    ImplicitVRLittleEndian,
+    ExplicitVRLittleEndian,
+    ExplicitVRBigEndian
+)
+
+# Transfer syntaxes
+ALL_TRANSFER_SYNTAXES = [
+    '1.2.840.10008.1.2',      # Implicit VR Little Endian
+    '1.2.840.10008.1.2.1',    # Explicit VR Little Endian
+    '1.2.840.10008.1.2.2',    # Explicit VR Big Endian
+    '1.2.840.10008.1.2.5',    # RLE Lossless
+    '1.2.840.10008.1.2.4.50', # JPEG Baseline (Process 1)
+    '1.2.840.10008.1.2.4.57', # JPEG Lossless, Non-Hierarchical
+    '1.2.840.10008.1.2.4.70', # JPEG Lossless, SV1
+    '1.2.840.10008.1.2.4.80', # JPEG-LS Lossless
+    '1.2.840.10008.1.2.4.81', # JPEG-LS Near-Lossless
+    '1.2.840.10008.1.2.4.90', # JPEG 2000 Lossless
+    '1.2.840.10008.1.2.4.91', # JPEG 2000
+    '1.2.840.10008.1.2.4.92', # MPEG2 MP@ML
+    '1.2.840.10008.1.2.4.93', # MPEG2 MP@HL
+    '1.2.840.10008.1.2.4.102',# MPEG-4 AVC/H.264 BD Compatible
+    '1.2.840.10008.1.2.4.103' # MPEG-4 AVC/H.264 High Profile
+]
+
+UNCOMPRESSED_TRANSFER_SYNTAXES = [
+    ImplicitVRLittleEndian,
+    ExplicitVRLittleEndian,
+    ExplicitVRBigEndian,
+]
+
+# SOP classes you want to support
+SUPPORTED_SOP_CLASSES = [
+    '1.2.840.10008.1.1',            # Verification
+    '1.2.840.10008.5.1.4.1.1.6',    # Ultrasound Image Storage
+    '1.2.840.10008.5.1.4.1.1.6.1',  # Ultrasound Image Storage (Retired)
+    '1.2.840.10008.5.1.4.1.1.3',    # Ultrasound Multi-frame Image Storage (Retired)
+    '1.2.840.10008.5.1.4.1.1.1.3.1', # Digital Intra – oral X-Ray Image Storage – for Processing
+    '1.2.840.10008.5.1.4.1.1.3.1',  # Ultrasound Multi-frame Image Storage
+    '1.2.840.10008.5.1.4.1.1.7.4',  # Secondary Capture (Multiframe True Color)
+    '1.2.840.10008.5.1.4.1.1.66.4', # Segmentation Storage
+    '1.2.840.10008.5.1.4.1.1.130',  # Surface Mesh Storage
+    '1.2.840.10008.1.20.1',         # Storage Commitment Push Model
+]
+
+# --- Configuration ---
+FORWARD_DESTINATIONS = {
+    # "AE_TITLE": ("hostname", port)
+    "DCM4CHEE": ("3.106.12.127", 11112)
+}
 
 # Parse the environment
 env = Env()
@@ -63,6 +105,7 @@ add_studyuid_prefix = env.bool("ADD_STUDYUID_PREFIX", False)
 s3_upload_workers = env.int("S3_UPLOAD_WORKERS", 10)
 conversion_workers = env.int("CONVERSION_WORKERS", 5)
 api_workers = env.int("API_WORKERS", 3)
+forwarding_workers = env.int("FORWARDING_WORKERS", 2)
 scp_port = env.int("SCP_PORT", 11112)
 loglevel = env.log_level("LOG_LEVEL", "INFO")
 dicom_prefix = env("DICOM_PREFIX", "")
@@ -120,6 +163,12 @@ class ConversionResult:
     dicom_size: int = 0
 
 @dataclass
+class ForwardingTask:
+    """Data class for forwarding tasks"""
+    dicom_path: str
+    task_id: str
+
+@dataclass
 class ProcessingMetrics:
     """Metrics tracking for the processing pipeline"""
     total_received: int = 0
@@ -127,9 +176,12 @@ class ProcessingMetrics:
     total_failed: int = 0
     total_uploaded: int = 0
     upload_failures: int = 0
+    total_forwarded: int = 0
+    forwarding_failures: int = 0
     api_successes: int = 0
     api_failures: int = 0
     queue_depth: int = 0
+    forwarding_queue_depth: int = 0
     processing_times: list = None
     total_received_size: int = 0
     total_processed_size: int = 0
@@ -180,6 +232,7 @@ class ResourceManager:
         self.conversion_queue = Queue(maxsize=max_queue_size)
         self.upload_queue = Queue(maxsize=max_queue_size)
         self.api_queue = Queue(maxsize=max_queue_size)
+        self.forwarding_queue = Queue(maxsize=max_queue_size)
         
         # Create separate thread pools
         self.conversion_executor = ThreadPoolExecutor(
@@ -193,6 +246,10 @@ class ResourceManager:
         self.api_executor = ThreadPoolExecutor(
             max_workers=api_workers,
             thread_name_prefix="api"
+        )
+        self.forwarding_executor = ThreadPoolExecutor(
+            max_workers=forwarding_workers,
+            thread_name_prefix="forwarding"
         )
         
         # Track active futures with weak references to prevent memory leaks
@@ -251,6 +308,12 @@ class ResourceManager:
             daemon=True,
             name="api-dispatcher"
         ).start()
+
+        threading.Thread(
+            target=self._forwarding_worker,
+            daemon=True,
+            name="forwarding-dispatcher"
+        ).start()
     
     def _health_check_loop(self):
         """Periodic health check and cleanup"""
@@ -273,8 +336,10 @@ class ResourceManager:
         total_size_left_to_process = m.total_received_size - m.total_processed_size
         logging.info(
             f"Metrics - Received: {m.total_received}, Processed: {m.total_processed}, "
-            f"Failed: {m.total_failed}, Queue depth: {m.queue_depth}, "
+            f"Failed: {m.total_failed}, Conversion Queue: {m.queue_depth}, "
+            f"Forwarding Queue: {m.forwarding_queue_depth}, "
             f"Upload success: {m.total_uploaded}, Upload failures: {m.upload_failures}, "
+            f"Forward success: {m.total_forwarded}, Forward failures: {m.forwarding_failures}, "
             f"API success: {m.api_successes}, API failures: {m.api_failures}, "
             f"Total size of processed files: {m.total_processed_size}, "
             f"Total size of received files: {m.total_received_size}, "
@@ -295,6 +360,16 @@ class ResourceManager:
             return True
         except Full:
             logging.warning("Conversion queue full, rejecting task")
+            return False
+
+    def submit_forwarding_task(self, task: ForwardingTask) -> bool:
+        """Submit a new forwarding task"""
+        try:
+            self.forwarding_queue.put_nowait(task)
+            self.metrics.forwarding_queue_depth = self.forwarding_queue.qsize()
+            return True
+        except Full:
+            logging.warning("Forwarding queue full, rejecting task")
             return False
     
     def _conversion_worker(self):
@@ -325,7 +400,22 @@ class ResourceManager:
                 continue
             except Exception as e:
                 logging.error(f"Upload worker error: {e}")
-    
+
+    def _forwarding_worker(self):
+        """Worker thread for processing forwarding queue"""
+        while not self._shutdown_event.is_set():
+            try:
+                task = self.forwarding_queue.get(timeout=1.0)
+                future = self.forwarding_executor.submit(self._forward_dicom, task)
+                self.active_futures.add(future)
+                future.add_done_callback(self._handle_forwarding_result)
+                self.forwarding_queue.task_done()
+                self.metrics.forwarding_queue_depth = self.forwarding_queue.qsize()
+            except Empty:
+                continue
+            except Exception as e:
+                logging.error(f"Forwarding worker error: {e}")
+
     def _api_worker(self):
         """Worker thread for processing API queue"""
         while not self._shutdown_event.is_set():
@@ -370,7 +460,20 @@ class ResourceManager:
         except Exception as e:
             self.metrics.upload_failures += 1
             logging.error(f"Upload result handling error: {e}")
-    
+
+    def _handle_forwarding_result(self, future: Future):
+        """Handle forwarding completion"""
+        try:
+            success, error_message = future.result()
+            if success:
+                self.metrics.total_forwarded += 1
+            else:
+                self.metrics.forwarding_failures += 1
+                logging.error(f"Forwarding failed: {error_message}")
+        except Exception as e:
+            self.metrics.forwarding_failures += 1
+            logging.error(f"Forwarding result handling error: {e}")
+
     def _handle_api_result(self, future: Future):
         """Handle API notification completion"""
         try:
@@ -389,39 +492,6 @@ class ResourceManager:
     def _process_dicom(self, task: ProcessingTask) -> ConversionResult:
         """Process DICOM file with proper error handling and cleanup"""
         start_time = time.time()
-
-        # # BEGIN: Added logic to save DICOM to a specific path
-        # try:
-        #     # Read the DICOM dataset
-        #     ds = dcmread(task.dicom_path)
-
-        #     # Extract UIDs for the new path
-        #     study_instance_uid = str(ds.StudyInstanceUID)
-        #     series_instance_uid = str(ds.SeriesInstanceUID)
-        #     sop_instance_uid = str(ds.SOPInstanceUID)
-
-        #     # Get s3_prefix from environment
-        #     s3_prefix = os.environ.get("S3_PREFIX", "")
-
-        #     # Construct the new path and filename
-        #     new_path = os.path.join("echo-dicom-s3", f"{s3_prefix}{study_instance_uid}", series_instance_uid)
-        #     new_filename = f"{sop_instance_uid}.dcm"
-        #     full_path = os.path.join(new_path, new_filename)
-
-        #     # Create intermediate directories if they don't exist
-        #     os.makedirs(new_path, exist_ok=True)
-
-        #     # Save the dataset to the new path
-        #     ds.save_as(full_path, write_like_original=False)
-        #     logging.info(f"DICOM file saved to: {full_path}")
-
-        #     # Upload the DICOM file to S3
-        #     s3_key = f"{s3_prefix}{study_instance_uid}/{series_instance_uid}/{sop_instance_uid}.dcm"
-        #     self._upload_dicom_to_s3(full_path, s3_key)
-        # except Exception as e:
-        #     logging.error(f"Failed to save DICOM to the new path: {e}")
-        # # END: Added logic
-
         temp_files_to_cleanup = []  # Only for cleanup on error
         dicom_size = 0
         
@@ -486,12 +556,6 @@ class ResourceManager:
                         dicom_size=dicom_size
                     )
             
-            # Clean up input DICOM file
-            try:
-                os.remove(task.dicom_path)
-            except OSError:
-                pass
-            
             processing_time = time.time() - start_time
             self.metrics.processing_times.append(processing_time)
             # Keep only last 1000 times to prevent memory growth
@@ -527,7 +591,78 @@ class ResourceManager:
                         os.remove(temp_file)
                 except OSError:
                     pass
-    
+
+    def _forward_dicom(self, task: ForwardingTask) -> tuple:
+        """Forward DICOM file to other SCPs"""
+        try:
+            ds = dcmread(task.dicom_path)
+            orig_ts = UID(ds.file_meta.TransferSyntaxUID)
+            # logging.info(f"Forwarding task {task.task_id}: SOP Class: {ds.SOPClassUID.name}, Transfer Syntax: {orig_ts.name}, is_compressed: {orig_ts.is_compressed}")
+
+            if orig_ts.is_compressed:
+                logging.info("Decompressing for forwarding")
+                ds.decompress()
+
+            # Set to Explicit VR Little Endian
+            ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+
+            # Request only Explicit VR Little Endian
+            transfer_syntaxes = [ExplicitVRLittleEndian]
+
+            ae = AE()
+            ae.add_requested_context(ds.SOPClassUID, transfer_syntaxes)
+
+            for ae_title, (host, port) in FORWARD_DESTINATIONS.items():
+                logging.info(f"Associating with {ae_title} at {host}:{port}")
+                assoc = ae.associate(host, port, ae_title=ae_title)
+                if assoc.is_established:
+                    logging.info("Association established")
+                    # Log accepted contexts
+                    # for ctx in assoc.accepted_contexts:
+                    #     logging.info(f"Accepted context: abstract {ctx.abstract_syntax}, transfer {ctx.transfer_syntax.name}")
+
+                    # Find accepted ts
+                    accepted_ts = None
+                    for ctx in assoc.accepted_contexts:
+                        if ctx.abstract_syntax == ds.SOPClassUID:
+                            accepted_ts = ctx.transfer_syntax
+                            break
+
+                    if accepted_ts is None:
+                        # logging.error(f"No accepted presentation context for SOP {ds.SOPClassUID.name}")
+                        assoc.release()
+                        return False, "No accepted presentation context"
+
+                    # logging.info(f"Accepted transfer syntax: {accepted_ts.name}")
+
+                    # Set dataset ts to accepted
+                    ds.file_meta.TransferSyntaxUID = accepted_ts
+
+                    # logging.info(f"Sending C-STORE with transfer syntax {ds.file_meta.TransferSyntaxUID.name}")
+
+                    status = assoc.send_c_store(ds)
+                    if status:
+                        logging.info(f'C-STORE to {ae_title} successful with status:')
+                    else:
+                        logging.error(f'C-STORE to {ae_title} failed with status:')
+                    assoc.release()
+                else:
+                    logging.error(f'Association with {ae_title} rejected or aborted.')
+            # Clean up input DICOM file
+            try:
+                os.remove(task.dicom_path)
+            except OSError:
+                pass
+            return True, None
+        except Exception as e:
+            logging.error(f"DICOM forwarding error for {task.task_id}: {e}", exc_info=True)
+            # Clean up input DICOM file even on error to prevent queue blockage
+            try:
+                os.remove(task.dicom_path)
+            except OSError:
+                pass
+            return False, str(e)
+
     def _upload_to_s3(self, result: ConversionResult) -> tuple:
         """Upload file to S3 with retry logic"""
         if not result.success or not result.output_path:
@@ -625,51 +760,17 @@ class ResourceManager:
         logging.error("All API notification attempts failed")
         return False
 
-    # def _upload_dicom_to_s3(self, file_path: str, s3_key: str) -> bool:
-    #     """Upload DICOM file to S3 with retry logic"""
-
-    #     # Check if file exists before attempting upload
-    #     if not os.path.exists(file_path):
-    #         logging.error(f"DICOM file not found: {file_path}")
-    #         return False
-
-    #     start_time = time.time()
-
-    #     try:
-    #         # Get file size for logging
-    #         file_size = os.path.getsize(file_path)
-    #         logging.debug(f"Starting S3 upload of {s3_key} ({file_size} bytes) to echo-dicom-s3 bucket")
-
-    #         with open(file_path, 'rb') as f:
-    #             self.s3_client_dicom.upload_fileobj(
-    #                 f, 
-    #                 "echo-dicom-s3", 
-    #                 s3_key
-    #             )
-
-    #         elapsed_time = time.time() - start_time
-    #         logging.info(f'S3 upload completed for {s3_key} in {elapsed_time:.2f}s to echo-dicom-s3 bucket')
-
-    #         return True
-
-    #     except FileNotFoundError as e:
-    #         logging.error(f'DICOM file disappeared during upload: {file_path}')
-    #         return False
-    #     except Exception as e:
-    #         logging.error(f'S3 upload error for {s3_key} to echo-dicom-s3 bucket: {e}')
-    #         return False
-    
     def shutdown(self):
         """Graceful shutdown of all resources"""
         logging.info("Initiating graceful shutdown...")
         self._shutdown_event.set()
         
         # Wait for queues to empty
-        for queue in [self.conversion_queue, self.upload_queue, self.api_queue]:
+        for queue in [self.conversion_queue, self.upload_queue, self.api_queue, self.forwarding_queue]:
             queue.join()
         
         # Shutdown executors
-        for executor in [self.conversion_executor, self.upload_executor, self.api_executor]:
+        for executor in [self.conversion_executor, self.upload_executor, self.api_executor, self.forwarding_executor]:
             executor.shutdown(wait=True)
         
         logging.info("Shutdown complete")
@@ -848,10 +949,11 @@ def handle_store(event):
         finally:
             temp_dicom.close()
         
+        task_id=f"{int(start_time * 1000)}_{threading.current_thread().ident}"
         # Create processing task
         task = ProcessingTask(
             dicom_path=temp_dicom_path,
-            task_id=f"{int(start_time * 1000)}_{threading.current_thread().ident}",
+            task_id=task_id,
             created_at=start_time
         )
         
@@ -864,7 +966,19 @@ def handle_store(event):
                 pass
             logging.warning("Failed to submit task to processing queue")
             return 0xA700  # Out of resources
-        
+
+        # Create forwarding task
+        forwarding_task = ForwardingTask(
+            dicom_path=temp_dicom_path,
+            task_id=task_id
+        )
+
+        # Submit task to forwarding pipeline
+        if not resource_manager.submit_forwarding_task(forwarding_task):
+            # This part is tricky. If forwarding queue is full, we might want to handle it differently.
+            # For now, we'll just log it. The file will still be processed for conversion.
+            logging.warning("Failed to submit task to forwarding queue")
+
         # Optional C-STORE delay for throttling
         if cstore_delay_ms > 0:
             time.sleep(cstore_delay_ms / 1000)
@@ -884,6 +998,7 @@ def main():
     logging.warning('Starting DICOM C-STORE application...')
     logging.warning(f'Configuration: conversion_workers={conversion_workers}, '
                    f's3_upload_workers={s3_upload_workers}, api_workers={api_workers}, '
+                   f'forwarding_workers={forwarding_workers}, '
                    f'max_queue_size={max_queue_size}, max_concurrent_processing={max_concurrent_processing}')
     
     # Initialize resource manager

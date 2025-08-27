@@ -190,6 +190,17 @@ class ProcessingMetrics:
         if self.processing_times is None:
             self.processing_times = []
 
+@dataclass
+class TaskCompletionTracker:
+    """Tracks completion of both upload and forwarding for a single DICOM file"""
+    task_id: str
+    dicom_path: str
+    upload_completed: bool = False
+    forwarding_completed: bool = False
+    
+    def is_fully_completed(self) -> bool:
+        return self.upload_completed and self.forwarding_completed
+
 class CircuitBreaker:
     """Simple circuit breaker for API calls"""
     def __init__(self, failure_threshold: int = 5, timeout: int = 60):
@@ -257,6 +268,10 @@ class ResourceManager:
         self.metrics = ProcessingMetrics()
         self.circuit_breaker = CircuitBreaker()
         self._shutdown_event = threading.Event()
+        
+        # Track task completions to ensure both workers complete before file cleanup
+        self.completion_trackers = {}  # task_id -> TaskCompletionTracker
+        self._completion_lock = threading.Lock()
         
         # Create S3 client with connection pooling
         self.s3_client = boto3.client(
@@ -351,6 +366,49 @@ class ResourceManager:
         return (self.conversion_queue.qsize() < max_queue_size * 0.9 and 
                 len(self.active_futures) < max_concurrent_processing)
     
+    def _register_task_for_completion(self, task_id: str, dicom_path: str):
+        """Register a task for completion tracking"""
+        with self._completion_lock:
+            self.completion_trackers[task_id] = TaskCompletionTracker(
+                task_id=task_id,
+                dicom_path=dicom_path
+            )
+    
+    def _mark_upload_completed(self, task_id: str) -> bool:
+        """Mark upload as completed and return True if both operations are done"""
+        with self._completion_lock:
+            if task_id in self.completion_trackers:
+                tracker = self.completion_trackers[task_id]
+                tracker.upload_completed = True
+                return tracker.is_fully_completed()
+        return False
+    
+    def _mark_forwarding_completed(self, task_id: str) -> bool:
+        """Mark forwarding as completed and return True if both operations are done"""
+        with self._completion_lock:
+            if task_id in self.completion_trackers:
+                tracker = self.completion_trackers[task_id]
+                tracker.forwarding_completed = True
+                return tracker.is_fully_completed()
+        return False
+    
+    def _cleanup_completed_task(self, task_id: str):
+        """Clean up the DICOM file and remove tracker for completed task"""
+        with self._completion_lock:
+            if task_id in self.completion_trackers:
+                tracker = self.completion_trackers[task_id]
+                if tracker.is_fully_completed():
+                    # Clean up the original DICOM file
+                    try:
+                        if os.path.exists(tracker.dicom_path):
+                            os.remove(tracker.dicom_path)
+                            logging.info(f"Cleaned up DICOM file after both workers completed: {tracker.dicom_path}")
+                    except OSError as e:
+                        logging.warning(f"Failed to cleanup DICOM file {tracker.dicom_path}: {e}")
+                    
+                    # Remove tracker
+                    del self.completion_trackers[task_id]
+    
     def submit_task(self, task: ProcessingTask) -> bool:
         """Submit a new processing task"""
         try:
@@ -441,6 +499,9 @@ class ResourceManager:
             else:
                 self.metrics.total_failed += 1
                 logging.error(f"Conversion failed for task {result.task_id}: {result.error}")
+                # Mark upload as completed (failed) to allow cleanup
+                if self._mark_upload_completed(result.task_id):
+                    self._cleanup_completed_task(result.task_id)
         except Exception as e:
             self.metrics.total_failed += 1
             logging.error(f"Conversion result handling error: {e}")
@@ -457,6 +518,10 @@ class ResourceManager:
                     self.api_queue.put_nowait(api_payload)
             else:
                 self.metrics.upload_failures += 1
+            
+            # Mark upload as completed and cleanup if both workers are done
+            if self._mark_upload_completed(result.task_id):
+                self._cleanup_completed_task(result.task_id)
         except Exception as e:
             self.metrics.upload_failures += 1
             logging.error(f"Upload result handling error: {e}")
@@ -464,12 +529,16 @@ class ResourceManager:
     def _handle_forwarding_result(self, future: Future):
         """Handle forwarding completion"""
         try:
-            success, error_message = future.result()
+            success, error_message, task_id = future.result()
             if success:
                 self.metrics.total_forwarded += 1
             else:
                 self.metrics.forwarding_failures += 1
                 logging.error(f"Forwarding failed: {error_message}")
+            
+            # Mark forwarding as completed and cleanup if both workers are done
+            if self._mark_forwarding_completed(task_id):
+                self._cleanup_completed_task(task_id)
         except Exception as e:
             self.metrics.forwarding_failures += 1
             logging.error(f"Forwarding result handling error: {e}")
@@ -648,20 +717,12 @@ class ResourceManager:
                     assoc.release()
                 else:
                     logging.error(f'Association with {ae_title} rejected or aborted.')
-            # Clean up input DICOM file
-            try:
-                os.remove(task.dicom_path)
-            except OSError:
-                pass
-            return True, None
+            # File cleanup will be handled centrally after both workers complete
+            return True, None, task.task_id
         except Exception as e:
             logging.error(f"DICOM forwarding error for {task.task_id}: {e}", exc_info=True)
-            # Clean up input DICOM file even on error to prevent queue blockage
-            try:
-                os.remove(task.dicom_path)
-            except OSError:
-                pass
-            return False, str(e)
+            # File cleanup will be handled centrally after both workers complete
+            return False, str(e), task.task_id
 
     def _upload_to_s3(self, result: ConversionResult) -> tuple:
         """Upload file to S3 with retry logic"""
@@ -974,10 +1035,18 @@ def handle_store(event):
         )
 
         # Submit task to forwarding pipeline
-        if not resource_manager.submit_forwarding_task(forwarding_task):
+        forwarding_submitted = resource_manager.submit_forwarding_task(forwarding_task)
+        if not forwarding_submitted:
             # This part is tricky. If forwarding queue is full, we might want to handle it differently.
             # For now, we'll just log it. The file will still be processed for conversion.
             logging.warning("Failed to submit task to forwarding queue")
+
+        # Register task for completion tracking
+        resource_manager._register_task_for_completion(task_id, temp_dicom_path)
+        
+        # If forwarding was not submitted, mark it as completed immediately
+        if not forwarding_submitted:
+            resource_manager._mark_forwarding_completed(task_id)
 
         # Optional C-STORE delay for throttling
         if cstore_delay_ms > 0:

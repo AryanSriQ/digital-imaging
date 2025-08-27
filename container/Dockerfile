@@ -72,7 +72,7 @@ ENV CONVERSION_WORKERS=5 \
     API_RETRY_ATTEMPTS=3 \
     HEALTH_CHECK_INTERVAL=60 \
     BOTO_MAX_POOL_CONNECTIONS=20 \
-    LOG_LEVEL=DEBUG
+    LOG_LEVEL=INFO
 
 # supervisord handles the stunnel and storescp processes
 CMD ["/usr/bin/supervisord","-c","/etc/supervisor/supervisord.conf"]

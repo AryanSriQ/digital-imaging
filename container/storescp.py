@@ -363,8 +363,12 @@ class ResourceManager:
     
     def can_accept_task(self) -> bool:
         """Check if system can accept new processing tasks"""
-        return (self.conversion_queue.qsize() < max_queue_size * 0.9 and 
-                len(self.active_futures) < max_concurrent_processing)
+        return (
+            self.conversion_queue.qsize() < max_queue_size * 0.9 and
+            self.forwarding_queue.qsize() < max_queue_size * 0.9 and
+            self.upload_queue.qsize() < max_queue_size * 0.9 and
+            self.api_queue.qsize() < max_queue_size * 0.9
+        )
     
     def _register_task_for_completion(self, task_id: str, dicom_path: str):
         """Register a task for completion tracking"""
@@ -666,19 +670,18 @@ class ResourceManager:
         try:
             ds = dcmread(task.dicom_path)
             orig_ts = UID(ds.file_meta.TransferSyntaxUID)
-            # logging.info(f"Forwarding task {task.task_id}: SOP Class: {ds.SOPClassUID.name}, Transfer Syntax: {orig_ts.name}, is_compressed: {orig_ts.is_compressed}")
-
-            if orig_ts.is_compressed:
-                logging.info("Decompressing for forwarding")
-                ds.decompress()
-
-            # Set to Explicit VR Little Endian
-            ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
-
-            # Request only Explicit VR Little Endian
-            transfer_syntaxes = [ExplicitVRLittleEndian]
+            # Negotiate original transfer syntax first, then fall back to uncompressed and other common syntaxes
+            transfer_syntaxes = list(dict.fromkeys(
+                [str(orig_ts)] +
+                [str(ts) for ts in UNCOMPRESSED_TRANSFER_SYNTAXES] +
+                ALL_TRANSFER_SYNTAXES
+            ))
 
             ae = AE()
+            # Tune SCU association in line with server settings
+            ae.maximum_pdu_size = maximum_pdu_size if maximum_pdu_size > 0 else 262144
+            ae.dimse_timeout = dimse_timeout
+            ae.network_timeout = network_timeout
             ae.add_requested_context(ds.SOPClassUID, transfer_syntaxes)
 
             for ae_title, (host, port) in FORWARD_DESTINATIONS.items():
@@ -701,19 +704,22 @@ class ResourceManager:
                         # logging.error(f"No accepted presentation context for SOP {ds.SOPClassUID.name}")
                         assoc.release()
                         return False, "No accepted presentation context"
+                    logging.info(f"Accepted transfer syntax: {accepted_ts}")
+                    accepted_ts_uid = UID(accepted_ts[0])
 
-                    # logging.info(f"Accepted transfer syntax: {accepted_ts.name}")
+                    # Decompress only if peer requires uncompressed
+                    if not accepted_ts_uid.is_compressed and orig_ts.is_compressed:
+                        logging.info("Peer accepted uncompressed TS - decompressing for forwarding")
+                        ds.decompress()
 
-                    # Set dataset ts to accepted
-                    ds.file_meta.TransferSyntaxUID = accepted_ts
-
-                    # logging.info(f"Sending C-STORE with transfer syntax {ds.file_meta.TransferSyntaxUID.name}")
+                    # Set dataset TS to match accepted context
+                    ds.file_meta.TransferSyntaxUID = accepted_ts_uid
 
                     status = assoc.send_c_store(ds)
                     if status:
-                        logging.info(f'C-STORE to {ae_title} successful with status:')
+                        logging.info(f'C-STORE to {ae_title} successful')
                     else:
-                        logging.error(f'C-STORE to {ae_title} failed with status:')
+                        logging.error(f'C-STORE to {ae_title} failed with status: {status}')
                     assoc.release()
                 else:
                     logging.error(f'Association with {ae_title} rejected or aborted.')
